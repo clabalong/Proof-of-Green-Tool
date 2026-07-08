@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Project-specific data — don't commit scraped/generated outputs
+scraped_data/
+debug_failed_json/
+*.xlsx
+greenlens_claims_*.xlsx
+
+# Environment variables (never commit API keys)
+.env
+
+# macOS
+.DS_Store
+
+# PyCharm
+.idea/

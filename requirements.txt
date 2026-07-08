@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+anthropic
+openai
+openpyxl
+python-dotenv
+json_repair
+playwright
