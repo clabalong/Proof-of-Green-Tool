@@ -12,7 +12,7 @@ MSc Business Analytics capstone dissertation project, Trinity Business School, T
 
 ## What this does
 
-GreenLens takes a single EU food/beverage SME's website URL and runs it through a multi-stage pipeline that:
+GreenLens takes a single EU SME's website URL and runs it through a multi-stage pipeline that:
 
 1. **Scrapes** the company's homepage, About, Sustainability, and Products pages
 2. **Extracts** every environmental/sustainability claim made on those pages, using an LLM
@@ -21,7 +21,6 @@ GreenLens takes a single EU food/beverage SME's website URL and runs it through 
 
 The output is a single Excel workbook per company: every claim, its category, its confidence and verification status, and whether the company's claimed certifications actually check out.
 
-This was built for a sample of ~15–20 SMEs across Ireland, France, Belgium, and Austria.
 
 ---
 
