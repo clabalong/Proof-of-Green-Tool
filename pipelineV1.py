@@ -1,10 +1,11 @@
 """
 ================================================================
- GREENLENS — PIPELINE ORCHESTRATOR (Stage 1 -> Stage 2 -> Stage 3)
+ GREENLENS — PIPELINE ORCHESTRATOR (Stage 1 -> Stage 2 -> Stage 3 -> News Check)
 ================================================================
- Thin glue script. Does not duplicate any scraping, extraction, or
- certification logic — it just imports the reusable functions from
- each stage and chains them together for a single company URL.
+ Thin glue script. Does not duplicate any scraping, extraction,
+ certification, or news-check logic — it just imports the reusable
+ functions from each stage and chains them together for a single
+ company URL.
 
  This is what the live tool's dashboard backend should call.
 
@@ -12,11 +13,14 @@
      python pipelineV1.py https://glenisk.com "Glenisk"
 
  Programmatic usage:
-     from pipeline import run_pipeline
-     claims_result, cert_result, excel_path = run_pipeline(url, company_name)
+     from pipelineV1 import run_pipeline
+     claims_result, cert_result, news_result, excel_path = run_pipeline(url, company_name)
 
- Requires ANTHROPIC_API_KEY to be set in the environment (used by
- both Stage 1's LLM link classification and Stage 2's extraction).
+ Requires ANTHROPIC_API_KEY and OPENAI_API_KEY to be set in the
+ environment (used by Stage 1's LLM link classification, Stage 2's
+ extraction + verification, and the news check's interpretation step).
+ NEWSAPI_KEY is also required for the news check — if unset, that
+ stage is skipped gracefully rather than failing the whole pipeline.
 ================================================================
 """
 
@@ -32,13 +36,15 @@ import openai
 from data_collection import run_single_scrape
 from extract_claims import process_scrape_result, write_excel
 from cert_verifier_api import run_certification_stage, append_certifications_sheet, merge_certifications_into_claims
+from news_verifier import check_news_controversy, append_news_sheet
 
 
 def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_verifier=None):
     """
     Runs Stage 1 (scrape) -> Stage 2 (claim extraction + GPT verification)
-    -> Stage 3 (certification check) for one company URL, and saves a
-    single-company Excel output with a "Certifications" sheet.
+    -> Stage 3 (certification check) -> news controversy check for one
+    company URL, and saves a single-company Excel output with
+    "Certifications" and "News Check" sheets.
 
     Args:
         url: company website URL
@@ -50,7 +56,7 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
                         once per company). A new one is created if not given.
 
     Returns:
-        (claims_result, cert_result, excel_path) tuple
+        (claims_result, cert_result, news_result, excel_path) tuple
     """
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if not anthropic_key:
@@ -83,11 +89,16 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
     )
     merge_certifications_into_claims(claims_result, cert_result)
 
+    if verbose:
+        print(f"\n{'#'*60}\n# NEWS CONTROVERSY CHECK\n{'#'*60}")
+    news_result = check_news_controversy(scrape_result["company_name"], anthropic_client, verbose=verbose)
+
     safe_name = scrape_result["company_name"].lower().replace(" ", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     excel_path = Path(f"greenlens_claims_{safe_name}_{timestamp}.xlsx")
     write_excel([claims_result], excel_path)
     append_certifications_sheet(excel_path, {scrape_result["company_name"]: cert_result})
+    append_news_sheet(excel_path, {scrape_result["company_name"]: news_result})
 
     if verbose:
         print(f"\n{'='*60}")
@@ -95,16 +106,17 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
         print(f"  Claims extracted : {len(claims_result['claims'])}")
         matched_registries = [r for r, info in cert_result.items() if info["matched"]]
         print(f"  Certifications   : {', '.join(matched_registries) if matched_registries else 'none matched'}")
+        print(f"  News controversy : {'YES — see News Check sheet' if news_result.get('controversy_detected') else 'none detected'}")
         print(f"  Scraped JSON     : {json_path}")
         print(f"  Excel output     : {excel_path}")
         print(f"{'='*60}\n")
 
-    return claims_result, cert_result, excel_path
+    return claims_result, cert_result, news_result, excel_path
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Run the GreenLens Stage 1 -> Stage 2 -> Stage 3 pipeline for a single company."
+        description="Run the GreenLens Stage 1 -> Stage 2 -> Stage 3 -> News Check pipeline for a single company."
     )
     parser.add_argument("url", help="Base URL of the SME website, e.g. https://glenisk.com")
     parser.add_argument(
