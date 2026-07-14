@@ -209,9 +209,14 @@ class CertVerifier:
         if self._emas_cache:
             return [r for recs in self._emas_cache.values() for r in recs]
 
-        resp = requests.get(EMAS_URL, headers=HEADERS, timeout=60)
-        resp.raise_for_status()
-        all_records = resp.json()
+        try:
+            resp = requests.get(EMAS_URL, headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+            all_records = resp.json()
+        except requests.exceptions.RequestException as e:
+            print(f"  [WARN] EMAS lookup failed ({type(e).__name__}) — "
+                  f"treating as no match for this run.")
+            return []
 
         for country in self.countries:
             self._emas_cache[country] = [
@@ -221,6 +226,8 @@ class CertVerifier:
 
     def check_emas(self, company_name: str) -> dict:
         records = self._load_emas()
+        if not records:
+            return {"matched": False, "best_match": None, "score": 0, "error": "lookup_failed_or_no_records"}
         best, score = _best_match(company_name, records, "organisationName")
         return {"matched": score >= MATCH_THRESHOLD, "best_match": best, "score": score}
 
@@ -235,22 +242,28 @@ class CertVerifier:
             return []
 
         records, offset = [], 0
-        while True:
-            params = {
-                "countryCode": code, "max": ORGANIC_PAGE_SIZE, "offset": offset,
-                "sort": "-issuedOn", "states": "ISSUED",
-            }
-            resp = requests.get(ORGANIC_URL, headers=HEADERS, params=params, timeout=30)
-            if resp.status_code == 500:
-                break  # hit the ~10k pagination cap; good enough for cached lookups
-            resp.raise_for_status()
-            page = resp.json()
-            if not page:
-                break
-            records.extend(page)
-            if len(page) < ORGANIC_PAGE_SIZE:
-                break
-            offset += ORGANIC_PAGE_SIZE
+        try:
+            while True:
+                params = {
+                    "countryCode": code, "max": ORGANIC_PAGE_SIZE, "offset": offset,
+                    "sort": "-issuedOn", "states": "ISSUED",
+                }
+                resp = requests.get(ORGANIC_URL, headers=HEADERS, params=params, timeout=30)
+                if resp.status_code == 500:
+                    break  # hit the ~10k pagination cap; good enough for cached lookups
+                resp.raise_for_status()
+                page = resp.json()
+                if not page:
+                    break
+                records.extend(page)
+                if len(page) < ORGANIC_PAGE_SIZE:
+                    break
+                offset += ORGANIC_PAGE_SIZE
+        except requests.exceptions.RequestException as e:
+            print(f"  [WARN] EU Organic lookup failed for {country} ({type(e).__name__}) — "
+                  f"using whatever was fetched before the failure ({len(records)} records).")
+            # fall through and cache/return whatever was collected so far,
+            # rather than losing it entirely
 
         self._organic_cache[country] = records
         return records
@@ -259,6 +272,9 @@ class CertVerifier:
         all_records = []
         for country in self.countries:
             all_records.extend(self._load_organic_country(country))
+
+        if not all_records:
+            return {"matched": False, "best_match": None, "score": 0, "error": "lookup_failed_or_no_records"}
 
         # operator name is nested: record["operator"]["name"]
         flat = [{"name": (r.get("operator") or {}).get("name", ""), "_raw": r} for r in all_records]
@@ -279,12 +295,18 @@ class CertVerifier:
                 "per_page": 5,
             }]
         }
-        resp = requests.post(
-            BCORP_URL, headers={**HEADERS, "Content-Type": "application/json"},
-            params={"x-typesense-api-key": BCORP_API_KEY}, json=payload, timeout=15,
-        )
-        resp.raise_for_status()
-        hits = resp.json()["results"][0].get("hits", [])
+        try:
+            resp = requests.post(
+                BCORP_URL, headers={**HEADERS, "Content-Type": "application/json"},
+                params={"x-typesense-api-key": BCORP_API_KEY}, json=payload, timeout=15,
+            )
+            resp.raise_for_status()
+            hits = resp.json()["results"][0].get("hits", [])
+        except requests.exceptions.RequestException as e:
+            print(f"  [WARN] B Corp lookup failed ({type(e).__name__}) — "
+                  f"treating as no match for this run.")
+            return {"matched": False, "best_match": None, "score": 0, "error": "lookup_failed"}
+
         if not hits:
             return {"matched": False, "best_match": None, "score": 0}
 
@@ -293,11 +315,29 @@ class CertVerifier:
         return {"matched": score >= MATCH_THRESHOLD, "best_match": best, "score": score}
 
     # -- Combined ----------------------------------------------------------
-    def check_company(self, company_name: str) -> dict:
+    def check_company(self, company_name: str, verbose: bool = True) -> dict:
+        if verbose:
+            print("    -> EMAS...", end=" ", flush=True)
+        emas = self.check_emas(company_name)
+        if verbose:
+            print("done")
+
+        if verbose:
+            print("    -> EU Organic...", end=" ", flush=True)
+        eu_organic = self.check_eu_organic(company_name)
+        if verbose:
+            print("done")
+
+        if verbose:
+            print("    -> B Corp...", end=" ", flush=True)
+        bcorp = self.check_bcorp(company_name)
+        if verbose:
+            print("done")
+
         return {
-            "emas": self.check_emas(company_name),
-            "eu_organic": self.check_eu_organic(company_name),
-            "bcorp": self.check_bcorp(company_name),
+            "emas": emas,
+            "eu_organic": eu_organic,
+            "bcorp": bcorp,
         }
 
 
@@ -595,10 +635,25 @@ def run_certification_stage(company_name: str, countries: list[str] = None,
     if verbose:
         print(f"  Checking certifications for: {company_name}")
 
-    result = verifier.check_company(company_name)
+    result = verifier.check_company(company_name, verbose=verbose)
+
+    if verbose:
+        print("    -> Bord Bia...", end=" ", flush=True)
     result["bordbia"] = check_bordbia(company_name, company_url=company_url, cache_path=bordbia_cache_path)
+    if verbose:
+        print("done")
+
+    if verbose:
+        print("    -> Biopartenaire...", end=" ", flush=True)
     result["biopartenaire"] = check_biopartenaire(company_name, company_url=company_url)
+    if verbose:
+        print("done")
+
+    if verbose:
+        print("    -> BioED...", end=" ", flush=True)
     result["bioed"] = check_bioed(company_name)
+    if verbose:
+        print("done")
 
     if verbose:
         for registry, info in result.items():
