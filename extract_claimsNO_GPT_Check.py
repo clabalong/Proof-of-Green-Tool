@@ -6,24 +6,27 @@ using the Claude API, and flags each claim as confidence-verified based on a
 threshold applied to the extraction model's own "confidence" score — no
 second (GPT) model call. Writes results to an Excel file.
 
-Difference from v1 (extract_claims.py):
-    v1 sent every extracted claim to a separate OpenAI model for an
-    independent true/false verification pass ("gpt_verified" / "gpt_notes").
-    v2 removes that call entirely. Instead, a claim is marked verified if
-    its own extraction "confidence" score meets CONFIDENCE_THRESHOLD (0.8
-    by default). This is faster and needs no OPENAI_API_KEY, at the cost
-    of no longer being an independent cross-check — it's just thresholding
-    the extractor's self-reported confidence.
+Difference from the main version (extract_claims_updated.py):
+    The main version sends every extracted claim to a separate OpenAI model
+    for an independent multi-stage validation pass (text faithfulness,
+    environmental relevance, company attribution, completeness, category
+    check). This version removes that call entirely. Instead, a claim is
+    marked verified if its own extraction "confidence" score meets
+    CONFIDENCE_THRESHOLD (0.8 by default). This is faster and needs no
+    OPENAI_API_KEY, at the cost of no longer being an independent
+    cross-check — it's just thresholding the extractor's self-reported
+    confidence. Everything else (extraction prompt, JSON-repair fallback,
+    certification checks, news check) is identical to the main pipeline.
 
 Usage:
-    python extract_claims_v2.py                          # process all JSONs in ./data/
-    python extract_claims_v2.py --input ./data/          # same, explicit folder
-    python extract_claims_v2.py --input ballymaloe.json  # single file
-    python extract_claims_v2.py --input ./data/ --output results.xlsx
-    python extract_claims_v2.py --threshold 0.7          # override the 0.8 default
+    python extract_claimsNO_GPT_Check.py                          # process all JSONs in ./data/
+    python extract_claimsNO_GPT_Check.py --input ./data/          # same, explicit folder
+    python extract_claimsNO_GPT_Check.py --input ballymaloe.json  # single file
+    python extract_claimsNO_GPT_Check.py --input ./data/ --output results.xlsx
+    python extract_claimsNO_GPT_Check.py --threshold 0.7          # override the 0.8 default
 
-Programmatic usage (e.g. from pipelineV2.py, chained straight after Stage 1):
-    from extract_claims_v2 import process_scrape_result
+Programmatic usage (e.g. from pipelineNO_GPT_Check.py, chained straight after Stage 1):
+    from extract_claimsNO_GPT_Check import process_scrape_result
     claims_result = process_scrape_result(anthropic_client, scrape_result_dict)
 
 Requirements:
@@ -68,6 +71,10 @@ Include:
 Do NOT include:
 - Pure product descriptions with no environmental angle
 - Navigation links, cookie notices, contact details
+
+Extract complete claim-bearing passages rather than isolated keywords, section headings, article titles, podcast titles, or navigation text.
+When a claim depends on surrounding text, include enough of the original sentence or adjacent sentence to preserve its subject, scope, and qualification.
+Do not extract a standalone word such as "sustainability", "organic", or "green" unless it forms part of a product name or phrase that itself communicates an environmental characteristic to consumers.
 
 Return ONLY a valid JSON array. Each object must have these exact fields:
 {

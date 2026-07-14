@@ -60,6 +60,10 @@ Do NOT include:
 - Pure product descriptions with no environmental angle
 - Navigation links, cookie notices, contact details
 
+Extract complete claim-bearing passages rather than isolated keywords, section headings, article titles, podcast titles, or navigation text.
+When a claim depends on surrounding text, include enough of the original sentence or adjacent sentence to preserve its subject, scope, and qualification.
+Do not extract a standalone word such as "sustainability", "organic", or "green" unless it forms part of a product name or phrase that itself communicates an environmental characteristic to consumers.
+
 Return ONLY a valid JSON array. Each object must have these exact fields:
 {
   "text": "verbatim claim as it appears on the page",
@@ -78,22 +82,152 @@ No preamble, no markdown fences, no trailing text — just the JSON array."""
 VERIFICATION_MODEL = "gpt-5.5"  # OpenAI's current flagship as of mid-2026;
                                  # use "gpt-5.4-mini" instead for a cheaper pass
 
-VERIFICATION_SYSTEM_PROMPT = """You are an independent auditor checking another AI's work.
+VERIFICATION_SYSTEM_PROMPT = """You are an independent environmental-claim validation auditor.
 
-You will be given the raw text of a company web page, and a list of environmental/sustainability claims that were extracted from it by a different AI system. Your job is to independently verify EACH claim:
+You will receive:
+1. The raw text from a company webpage.
+2. Environmental claims extracted by another AI model.
 
-1. Does this exact claim (or a faithful near-exact rendering of it) actually appear in the page text? Flag as NOT verified if it looks paraphrased, exaggerated, or not present at all.
-2. Is the assigned category reasonable for this claim? Categories are: carbon | biodiversity | packaging | water | sourcing | certification | waste | general
-3. Does this genuinely qualify as an environmental/sustainability claim, or should it have been excluded (e.g. it's just a plain product description, navigation text, or contact info with no environmental angle)?
+For each extracted item, independently determine whether it is a valid environmental marketing claim suitable for ECGT compliance classification.
 
-Return ONLY a valid JSON array, one object per claim IN THE SAME ORDER as given, with these exact fields:
+============================================================
+STAGE 1 — TEXTUAL FAITHFULNESS
+============================================================
+Determine whether the extracted claim appears in the supplied page text.
+
+The claim does not need to be character-for-character identical, but it must be a faithful, near-exact representation of the page text.
+
+Set text_verified = false when:
+- The claim is not present in the page text.
+- The extractor invented information.
+- The extractor exaggerated the original wording.
+- The extractor combined separate passages in a misleading way.
+- Important qualifications were removed.
+- The English translation changes the claim's meaning.
+
+============================================================
+STAGE 2 — ENVIRONMENTAL RELEVANCE
+============================================================
+Determine whether the item asserts or implies an environmental, sustainability, circularity, sourcing, nature, waste, emissions, certification, farming-practice, or resource-use characteristic.
+
+Valid environmental claims include:
+- Specific environmental performance claims.
+- Generic environmental language.
+- Certification or environmental label claims.
+- Organic, regenerative, biodynamic or permaculture claims.
+- Local or responsible sourcing claims with an environmental implication.
+- Carbon, emissions, biodiversity, water, waste or packaging claims.
+- Environmental aspirations or future commitments.
+- Statements intended to influence consumer perceptions of environmental performance.
+
+Do not reject a claim merely because it is vague, unsubstantiated or potentially misleading. Those matters belong to the later ECGT classification stage.
+
+============================================================
+STAGE 3 — COMPANY ATTRIBUTION
+============================================================
+Determine whether the page presents the statement as a claim made by, adopted by, or clearly attributable to the company or its products.
+
+Set company_attributed = false when the text is only:
+- A statement made by an unrelated third party.
+- A quotation that the company does not adopt or endorse.
+- A news headline about another organisation.
+- A guest's opinion in a podcast or interview.
+- A general educational statement not connected to the company's own products, operations, commitments or services.
+
+A statement may still be company-attributed when:
+- It appears in the company's own product description.
+- It describes the company's farm, packaging, sourcing or operations.
+- It expresses the company's mission, goal or commitment.
+- The company republishes the statement as part of its marketing message.
+
+============================================================
+STAGE 4 — COMPLETE, ASSESSABLE CLAIM
+============================================================
+Determine whether the extracted text contains enough meaning to be assessed.
+
+Set complete_claim = false when it is merely:
+- Navigation text.
+- A button such as "Read more".
+- A standalone page-section label such as "Sustainability".
+- A product or article title with no environmental assertion.
+- A podcast episode title that does not itself assert something about the company or its products.
+- An incomplete sentence fragment whose meaning depends on missing text.
+- Contact details, cookie text or administrative content.
+
+Important distinctions:
+
+"Farm Veg Box"
+→ Not a complete environmental claim.
+
+"Organic Farm Veg Box"
+→ May be a valid environmental/product claim because "organic" asserts a regulated product characteristic.
+
+"Sustainability"
+→ Not a complete claim.
+
+"We make sustainability central to every decision"
+→ Valid environmental claim, although possibly vague.
+
+"Episode 42: Climate Change"
+→ Normally not a company environmental claim.
+
+"We reduced packaging weight by 20% in 2025"
+→ Valid environmental claim.
+
+"Our farm sequesters carbon every year"
+→ Valid environmental claim. Do not assess whether it is proven at this stage.
+
+============================================================
+STAGE 5 — CATEGORY CHECK
+============================================================
+Review the assigned category.
+
+Allowed categories:
+carbon | biodiversity | packaging | water | sourcing | certification | waste | general
+
+Return the most appropriate category. Do not mark an otherwise valid claim as invalid merely because the original category was wrong.
+
+============================================================
+FINAL DECISION
+============================================================
+Set valid_claim = true only when all of the following are true:
+- text_verified is true
+- environmental_relevance is true
+- company_attributed is true
+- complete_claim is true
+
+Otherwise set valid_claim = false.
+
+Return one result for every supplied item, in exactly the same order.
+
+Return ONLY a valid JSON array with these exact fields:
 {
-  "id": <the same id number given for this claim>,
-  "verified": true or false,
-  "notes": "brief reason, especially if verified is false"
+  "id": 0,
+  "text_verified": true,
+  "environmental_relevance": true,
+  "company_attributed": true,
+  "complete_claim": true,
+  "valid_claim": true,
+  "corrected_category": "packaging",
+  "exclusion_reason": null,
+  "notes": "Brief explanation of the decision."
 }
 
-No preamble, no markdown fences, no trailing text — just the JSON array."""
+For exclusion_reason, use exactly one of:
+- null
+- "NOT_FOUND_IN_TEXT"
+- "PARAPHRASED_OR_EXAGGERATED"
+- "NOT_ENVIRONMENTAL"
+- "NOT_COMPANY_ATTRIBUTED"
+- "TITLE_OR_NAVIGATION"
+- "INCOMPLETE_FRAGMENT"
+- "OTHER"
+
+No preamble.
+No markdown fences.
+No trailing text.
+Only the JSON array.
+""".strip()
 
 
 def verify_claims_with_gpt(openai_client, page_text: str, claims: list[dict], verbose: bool = True) -> list[dict]:
@@ -136,23 +270,59 @@ def verify_claims_with_gpt(openai_client, page_text: str, claims: list[dict], ve
             results = json_repair.loads(raw)
 
         results_by_id = {r["id"]: r for r in results if isinstance(r, dict) and "id" in r}
-        for i, c in enumerate(claims):
-            r = results_by_id.get(i)
-            if r:
-                c["gpt_verified"] = r.get("verified")
-                c["gpt_notes"] = r.get("notes", "")
+        allowed_categories = {
+            "carbon", "biodiversity", "packaging", "water",
+            "sourcing", "certification", "waste", "general"
+        }
+
+        for i, claim in enumerate(claims):
+            result = results_by_id.get(i)
+
+            if result:
+                claim["gpt_text_verified"] = result.get("text_verified")
+                claim["gpt_environmental_relevance"] = result.get("environmental_relevance")
+                claim["gpt_company_attributed"] = result.get("company_attributed")
+                claim["gpt_complete_claim"] = result.get("complete_claim")
+                claim["gpt_valid_claim"] = result.get("valid_claim")
+                claim["gpt_corrected_category"] = result.get(
+                    "corrected_category", claim.get("category", "general")
+                )
+                claim["gpt_exclusion_reason"] = result.get("exclusion_reason")
+                claim["gpt_notes"] = result.get("notes", "")
+
+                # Backward compatibility with the existing workbook field.
+                claim["gpt_verified"] = result.get("valid_claim")
+
+                # Apply a corrected category only to valid claims.
+                corrected = result.get("corrected_category")
+                if result.get("valid_claim") is True and corrected in allowed_categories:
+                    claim["category"] = corrected
             else:
-                c["gpt_verified"] = None
-                c["gpt_notes"] = "No verification result returned for this claim"
+                claim["gpt_text_verified"] = None
+                claim["gpt_environmental_relevance"] = None
+                claim["gpt_company_attributed"] = None
+                claim["gpt_complete_claim"] = None
+                claim["gpt_valid_claim"] = None
+                claim["gpt_corrected_category"] = ""
+                claim["gpt_exclusion_reason"] = "OTHER"
+                claim["gpt_verified"] = None
+                claim["gpt_notes"] = "No verification result returned for this claim"
 
         if verbose:
-            verified_count = sum(1 for c in claims if c.get("gpt_verified") is True)
-            print(f"[GPT verification: {verified_count}/{len(claims)} confirmed]", end=" ")
+            verified_count = sum(1 for c in claims if c.get("gpt_valid_claim") is True)
+            print(f"[GPT validation: {verified_count}/{len(claims)} valid claims]", end=" ")
 
     except Exception as e:
         if verbose:
             print(f"[GPT verification FAILED: {type(e).__name__} — {e}]", end=" ")
         for c in claims:
+            c["gpt_text_verified"] = None
+            c["gpt_environmental_relevance"] = None
+            c["gpt_company_attributed"] = None
+            c["gpt_complete_claim"] = None
+            c["gpt_valid_claim"] = None
+            c["gpt_corrected_category"] = ""
+            c["gpt_exclusion_reason"] = "OTHER"
             c["gpt_verified"] = None
             c["gpt_notes"] = f"Verification pass failed: {e}"
 
@@ -330,12 +500,13 @@ def write_excel(results: list[dict], output_path: Path):
     headers = [
         "Company", "Page", "Category", "Verbatim Claim",
         "English Translation", "Language", "Confidence",
-        "GPT Verified", "GPT Notes",
+        "GPT Valid Claim", "Text Verified", "Environmental Relevance",
+        "Company Attributed", "Complete Claim", "Exclusion Reason", "GPT Notes",
         "Page URL", "Source File",
         "EMAS Verified", "EU Organic Verified", "B Corp Verified", "Bord Bia Verified",
         "Biopartenaire Verified", "BioED Verified"
     ]
-    col_widths = [22, 16, 14, 60, 60, 10, 12, 12, 45, 45, 25, 14, 16, 14, 15, 18, 14]
+    col_widths = [22, 16, 14, 60, 60, 10, 12, 14, 14, 20, 18, 14, 22, 45, 45, 25, 14, 16, 14, 15, 18, 14]
 
     # Header row
     header_fill = PatternFill("solid", fgColor="2C3E50")
@@ -373,7 +544,12 @@ def write_excel(results: list[dict], output_path: Path):
                 c.get("english_translation", c.get("text", "")),
                 c.get("language", "en").upper(),
                 round(conf, 2),
-                _yn("gpt_verified"),
+                _yn("gpt_valid_claim"),
+                _yn("gpt_text_verified"),
+                _yn("gpt_environmental_relevance"),
+                _yn("gpt_company_attributed"),
+                _yn("gpt_complete_claim"),
+                c.get("gpt_exclusion_reason", ""),
                 c.get("gpt_notes", ""),
                 c.get("page_url", ""),
                 res["source_file"],
