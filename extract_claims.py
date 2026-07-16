@@ -79,7 +79,7 @@ No preamble, no markdown fences, no trailing text — just the JSON array."""
 
 # ── Verification (independent second model) ────────────────────────────────
 
-VERIFICATION_MODEL = "gpt-5.5"  # OpenAI's current flagship as of mid-2026;
+VERIFICATION_MODEL = "gpt-5.4-mini"  # OpenAI's current flagship as of mid-2026;
                                  # use "gpt-5.4-mini" instead for a cheaper pass
 
 VERIFICATION_SYSTEM_PROMPT = """You are an independent environmental-claim validation auditor.
