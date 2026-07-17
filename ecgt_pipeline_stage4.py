@@ -39,20 +39,20 @@
  stage (run_certification_stage, check_news_controversy, etc.) uses.
 
  Output : ecgt_classified.csv (standalone mode) — original columns +
-          four new ones matching the production schema:
-            ECGT Label, ECGT Rule Triggered, ECGT Explanation,
-            ECGT Review Flag
+          SIX new ones matching the production schema:
+            ECGT Label, ECGT Rule Triggered, ECGT Citation,
+            ECGT Explanation, ECGT Guidance, ECGT Review Flag
 
  NOTE ON COLUMN NAMING: write_excel() in extract_claims.py uses a FIXED
  header list and a positional values list keyed by snake_case dict
  keys (e.g. c.get("emas_verified")) — it does NOT dynamically render
  whatever keys exist on a claim dict. This stage writes
- "ecgt_label" / "ecgt_rule_triggered" / "ecgt_explanation" /
- "ecgt_review_flag" (snake_case) onto each claim dict to match that
- convention. extract_claims.py has been updated correspondingly to
- add "ECGT Label", "ECGT Rule Triggered", "ECGT Explanation",
- "ECGT Review Flag" to its header/value lists — both files need to
- stay in sync if either changes.
+ "ecgt_label" / "ecgt_rule_triggered" / "ecgt_citation" /
+ "ecgt_explanation" / "ecgt_guidance" / "ecgt_review_flag" (snake_case)
+ onto each claim dict to match that convention. extract_claims.py MUST
+ be updated to add the two new columns ("ECGT Citation", "ECGT
+ Guidance") to its header/value lists, or they will silently not
+ appear in the Excel output — both files need to stay in sync.
 
  Run (standalone):
    export ANTHROPIC_API_KEY="your-key-here"
@@ -79,11 +79,28 @@ MODEL_EXPLAIN = "claude-haiku-4-5"   # same model family as Step A
 INPUT_CSV     = "all_claims_labeled.csv"
 OUTPUT_CSV    = "ecgt_classified.csv"
 DELAY         = 0.3
-EXPLAIN_MAX_TOKENS = 300
+EXPLAIN_MAX_TOKENS = 350   # bumped from 300 — citation + guidance add length
 STEP_A_RETRIES = 3   # thin retry wrapper around classify_one — does not
                       # touch classify_one's internals, so the decision
                       # procedure itself stays byte-identical; only
                       # transient API failures get retried.
+
+# Citation reference table — the 8 rules from EU_Directive_2024_825_Rulings.json
+# that are actually in scope for food-SME environmental claims (the other 10,
+# ECGT_006-012 and ECGT_016-018, cover durability/software/reparability for
+# goods with digital elements and don't apply here — see the scoping decision
+# made earlier in this project). Given to Step B directly so it cites REAL
+# rule IDs and Annex/Article references from the Directive, not invented ones.
+ECGT_CITATION_TABLE = """
+ECGT_001 | Annex I, point 2a   | Uncertified Sustainability Label | RED
+ECGT_002 | Annex I, point 4a   | Generic Environmental Claim Without Evidence | RED
+ECGT_003 | Annex I, point 4b   | Overstated Scope of Environmental Claim | RED
+ECGT_004 | Annex I, point 4c   | Carbon Offset-Based Neutrality Claim | RED
+ECGT_005 | Annex I, point 10a  | Presenting Legal Requirements as Distinctive Features | RED
+ECGT_013 | Article 6(2)(d)     | Unsubstantiated Future Environmental Performance Claim | RED
+ECGT_014 | Article 6(2)(e)     | Advertising Irrelevant Consumer Benefits | AMBER
+ECGT_015 | Article 7(7)        | Incomplete Environmental/Social Comparison Information | AMBER
+"""
 
 
 def classify_one_with_retry(client: Anthropic, claim_text: str,
@@ -101,11 +118,49 @@ def classify_one_with_retry(client: Anthropic, claim_text: str,
     return "ERROR"
 
 
+def extract_json_object(raw: str) -> tuple[str, str]:
+    """Finds the first balanced {...} object in raw text and returns
+    (json_substring, discarded_trailing_text). Handles nested braces
+    and braces inside quoted strings correctly, so a '}' inside an
+    explanation string doesn't prematurely end the match.
+
+    This is the root-cause fix for 'Extra data' JSON errors: rather
+    than parsing the whole response and hoping nothing follows the
+    JSON, we only ever hand the parser the exact object substring."""
+    start = raw.find("{")
+    if start == -1:
+        return raw, ""
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start:i + 1], raw[i + 1:].strip()
+    return raw[start:], ""  # unbalanced — return what we have, nothing discarded
+
+
 def explain_claim(client: Anthropic, claim_text: str, registry_summary: str,
                    category: str, label: str) -> dict:
     """STEP B — documents a label that has already been decided.
     This call is not permitted to change the label; it only explains
-    it and flags whether a human should double-check it."""
+    it, cites the specific Directive rule, gives actionable guidance,
+    and flags whether a human should double-check it."""
     prompt = f"""{ECGT_RULES}
 
 You are documenting a compliance classification decision that has
@@ -129,11 +184,37 @@ tracked registries, an out-of-registry-scope partnership/sponsorship
 claim, an ambiguous specificity call, or any case where reasonable
 disagreement is plausible.
 
+Also cite the specific EU Directive (EU) 2024/825 rule this claim
+falls under, from this reference table (the only 8 rules relevant to
+food-SME environmental claims — pick the single best match, or
+"None — general principle, no single rule dominant" if genuinely
+none fit well):
+
+{ECGT_CITATION_TABLE}
+
+Finally, give ONE actionable guidance category for what the company
+should do about this specific claim:
+  - "REMOVE" — claim is a bare tagline/label with no salvageable
+    environmental content; it should be deleted, not fixed with more
+    evidence (typically RED, ECGT_001/002-style cases).
+  - "REWRITE" — claim's problem is how it's framed, not a lack of
+    evidence (overstated scope, offset-based neutrality stated as if
+    achieved, a legal minimum presented as a differentiator); it
+    needs rephrasing to be accurate.
+  - "SUBSTANTIATE" — claim's core content is fine but lacks
+    evidence, certification, or disclosed methodology/baseline; it
+    needs supporting proof, not different wording (typically AMBER
+    cases).
+  - "NONE" — claim is compliant as-is (typically GREEN), no action
+    needed.
+
 Return ONLY valid JSON, no markdown fences, no other text, in this
 exact format:
 {{
   "rule_triggered": "short reference, e.g. 'RED - bare tagline, no behaviour named' or 'AMBER - specific but no registry confirmed'",
+  "citation": "e.g. 'ECGT_002 - Annex I, point 4a - Generic Environmental Claim Without Evidence' or the none-fits string above",
   "explanation": "1-3 sentence explanation of why this label applies",
+  "guidance": "REMOVE, REWRITE, SUBSTANTIATE, or NONE",
   "review_flag": true or false
 }}"""
 
@@ -145,15 +226,21 @@ exact format:
         )
         raw = response.content[0].text.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
+        json_str, discarded = extract_json_object(raw)
+        if discarded:
+            print(f"    [Step B] model appended extra text after the JSON "
+                  f"(discarded, label unaffected): {discarded[:200]!r}")
         try:
-            result = json.loads(raw)
+            result = json.loads(json_str)
         except json.JSONDecodeError as parse_err:
-            result = json_repair.loads(raw)
+            result = json_repair.loads(json_str)
             print(f"    [Step B] strict JSON parse failed ({parse_err}) — "
                   f"recovered via json_repair")
         return {
             "rule_triggered": str(result.get("rule_triggered", "")),
+            "citation": str(result.get("citation", "")),
             "explanation": str(result.get("explanation", "")),
+            "guidance": str(result.get("guidance", "")).upper() or "NONE",
             "review_flag": bool(result.get("review_flag", False)),
         }
     except Exception as e:
@@ -168,7 +255,9 @@ exact format:
         # show a reviewer.
         return {
             "rule_triggered": "ERROR",
+            "citation": "ERROR",
             "explanation": f"Explanation generation failed: {e}",
+            "guidance": "ERROR",
             "review_flag": True,
         }
 
@@ -180,10 +269,11 @@ def run_ecgt_classification_stage(claims_result: dict, anthropic_client: Anthrop
     (merge_certifications_into_claims must already have populated the
     six *_verified fields on each claim in claims_result["claims"]).
 
-    Mutates claims_result["claims"] in place, adding four fields to
-    each claim dict: "ECGT Label", "ECGT Rule Triggered",
-    "ECGT Explanation", "ECGT Review Flag" — see module docstring for
-    the caveat on whether these column names survive write_excel().
+    Mutates claims_result["claims"] in place, adding six fields to
+    each claim dict: "ecgt_label", "ecgt_rule_triggered",
+    "ecgt_citation", "ecgt_explanation", "ecgt_guidance",
+    "ecgt_review_flag" — see module docstring for the extract_claims.py
+    sync requirement.
 
     Args:
         claims_result: the same dict produced by process_scrape_result()
@@ -215,14 +305,16 @@ def run_ecgt_classification_stage(claims_result: dict, anthropic_client: Anthrop
         if label in ("RED", "AMBER", "GREEN"):
             info = explain_claim(anthropic_client, text, registry, category, label)
         else:
-            info = {"rule_triggered": "N/A", "explanation":
+            info = {"rule_triggered": "N/A", "citation": "N/A", "explanation":
                      "Step A classification failed or returned UNKNOWN.",
-                     "review_flag": True}
+                     "guidance": "N/A", "review_flag": True}
         time.sleep(DELAY)
 
         claim["ecgt_label"] = label
         claim["ecgt_rule_triggered"] = info["rule_triggered"]
+        claim["ecgt_citation"] = info["citation"]
         claim["ecgt_explanation"] = info["explanation"]
+        claim["ecgt_guidance"] = info["guidance"]
         claim["ecgt_review_flag"] = info["review_flag"]
 
         label_counts[label] = label_counts.get(label, 0) + 1
@@ -253,7 +345,7 @@ def run():
         return
     client = Anthropic(api_key=api_key)
 
-    labels, rules_triggered, explanations, review_flags = [], [], [], []
+    labels, rules_triggered, citations, explanations, guidances, review_flags = [], [], [], [], [], []
     total = len(df)
 
     for i, (_, row) in enumerate(df.iterrows(), start=1):
@@ -272,14 +364,16 @@ def run():
         else:
             # Step A itself failed (ERROR/UNKNOWN) — nothing for Step B
             # to document; flag for review directly.
-            info = {"rule_triggered": "N/A", "explanation":
+            info = {"rule_triggered": "N/A", "citation": "N/A", "explanation":
                      "Step A classification failed or returned UNKNOWN.",
-                     "review_flag": True}
+                     "guidance": "N/A", "review_flag": True}
         time.sleep(DELAY)
 
         labels.append(label)
         rules_triggered.append(info["rule_triggered"])
+        citations.append(info["citation"])
         explanations.append(info["explanation"])
+        guidances.append(info["guidance"])
         review_flags.append(info["review_flag"])
 
         if i % 10 == 0 or i == total:
@@ -287,7 +381,9 @@ def run():
 
     df["ECGT Label"] = labels
     df["ECGT Rule Triggered"] = rules_triggered
+    df["ECGT Citation"] = citations
     df["ECGT Explanation"] = explanations
+    df["ECGT Guidance"] = guidances
     df["ECGT Review Flag"] = review_flags
 
     df.to_csv(OUTPUT_CSV, index=False)
