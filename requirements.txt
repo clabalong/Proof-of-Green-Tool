@@ -6,3 +6,5 @@ openpyxl
 python-dotenv
 json_repair
 playwright
+pandas
+scikit-learn
