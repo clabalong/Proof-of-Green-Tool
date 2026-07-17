@@ -1,11 +1,12 @@
 """
 ================================================================
- GREENLENS — PIPELINE ORCHESTRATOR (Stage 1 -> Stage 2 -> Stage 3 -> News Check)
+ GREENLENS — PIPELINE ORCHESTRATOR
+ (Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> News Check)
 ================================================================
  Thin glue script. Does not duplicate any scraping, extraction,
- certification, or news-check logic — it just imports the reusable
- functions from each stage and chains them together for a single
- company URL.
+ certification, classification, or news-check logic — it just
+ imports the reusable functions from each stage and chains them
+ together for a single company URL.
 
  This is what the live tool's dashboard backend should call.
 
@@ -14,11 +15,13 @@
 
  Programmatic usage:
      from pipelineV1 import run_pipeline
-     claims_result, cert_result, news_result, excel_path = run_pipeline(url, company_name)
+     claims_result, cert_result, ecgt_result, news_result, excel_path = run_pipeline(url, company_name)
 
  Requires ANTHROPIC_API_KEY and OPENAI_API_KEY to be set in the
  environment (used by Stage 1's LLM link classification, Stage 2's
- extraction + verification, and the news check's interpretation step).
+ extraction + verification, Stage 4's classification, and the news
+ check's interpretation step — Stage 4 reuses the same Anthropic
+ client already created for Stages 1/2, no separate key needed).
  NEWSAPI_KEY is also required for the news check — if unset, that
  stage is skipped gracefully rather than failing the whole pipeline.
 ================================================================
@@ -36,15 +39,18 @@ import openai
 from data_collection import run_single_scrape
 from extract_claims import process_scrape_result, write_excel
 from cert_verifier_api import run_certification_stage, append_certifications_sheet, merge_certifications_into_claims
+from ecgt_pipeline_stage4 import run_ecgt_classification_stage
 from news_verifier import check_news_controversy, append_news_sheet
 
 
 def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_verifier=None):
     """
     Runs Stage 1 (scrape) -> Stage 2 (claim extraction + GPT verification)
-    -> Stage 3 (certification check) -> news controversy check for one
-    company URL, and saves a single-company Excel output with
-    "Certifications" and "News Check" sheets.
+    -> Stage 3 (certification check) -> Stage 4 (ECGT classification)
+    -> news controversy check for one company URL, and saves a
+    single-company Excel output with "Certifications" and "News Check"
+    sheets (ECGT fields are merged directly into the "All Claims" sheet,
+    same pattern as the certification fields).
 
     Args:
         url: company website URL
@@ -56,7 +62,7 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
                         once per company). A new one is created if not given.
 
     Returns:
-        (claims_result, cert_result, news_result, excel_path) tuple
+        (claims_result, cert_result, ecgt_result, news_result, excel_path) tuple
     """
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if not anthropic_key:
@@ -90,6 +96,10 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
     merge_certifications_into_claims(claims_result, cert_result)
 
     if verbose:
+        print(f"\n{'#'*60}\n# STAGE 4 — ECGT CLASSIFICATION\n{'#'*60}")
+    ecgt_result = run_ecgt_classification_stage(claims_result, anthropic_client, verbose=verbose)
+
+    if verbose:
         print(f"\n{'#'*60}\n# NEWS CONTROVERSY CHECK\n{'#'*60}")
     news_result = check_news_controversy(scrape_result["company_name"], anthropic_client, verbose=verbose)
 
@@ -106,12 +116,14 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
         print(f"  Claims extracted : {len(claims_result['claims'])}")
         matched_registries = [r for r, info in cert_result.items() if info["matched"]]
         print(f"  Certifications   : {', '.join(matched_registries) if matched_registries else 'none matched'}")
+        print(f"  ECGT labels      : {ecgt_result['label_distribution']}")
+        print(f"  Flagged for review: {ecgt_result['review_flagged']}/{ecgt_result['total_claims']}")
         print(f"  News controversy : {'YES — see News Check sheet' if news_result.get('controversy_detected') else 'none detected'}")
         print(f"  Scraped JSON     : {json_path}")
         print(f"  Excel output     : {excel_path}")
         print(f"{'='*60}\n")
 
-    return claims_result, cert_result, news_result, excel_path
+    return claims_result, cert_result, ecgt_result, news_result, excel_path
 
 
 def _parse_args():
