@@ -29,9 +29,8 @@ import pandas as pd
 from google import genai
 from google.genai import types
 
-from claude_classifier import (
+from Classifier.claude_classifier import (
     ECGT_RULES,
-    FEW_SHOT_EXAMPLES,
     VERIFIED_FIELDS,
     build_registry_summary,
     build_fewshot_block,
