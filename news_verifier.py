@@ -2,52 +2,72 @@
 news_verifier.py
 
 Checks a company for recent negative environmental/greenwashing-related
-news coverage using NewsAPI.org — lawsuits, fines, greenwashing
+news coverage using Google News RSS — lawsuits, fines, greenwashing
 accusations, regulatory action. This is intentionally NEGATIVE-SIGNAL
 focused: positive press ("won a sustainability award") doesn't tell us
 anything about whether a company's CLAIMS are accurate, so it's not
 what this check looks for.
 
-IMPORTANT LIMITATIONS (NewsAPI free "Developer" tier):
-- Only returns articles from roughly the last month — no historical
-  archive access. This is a "catch anything breaking right now" check,
-  not a comprehensive audit of a company's history.
-- No full article text — only title, description, URL, source, and
-  publish date. To read a full article you'd need to follow the URL
-  and scrape it separately.
-- Free tier is explicitly for development/testing use, not production/
-  live deployment — fine for this research context, worth knowing if
-  this tool is ever deployed publicly.
+IMPORTANT LIMITATIONS (Google News RSS):
+- This is an unofficial, undocumented feed — no API key, no published
+  SLA, no rate-limit guarantees. Google can change or block it without
+  notice. Fine for research use; do not treat as a stable production
+  dependency.
+- Results are whatever Google News' own ranking/aggregation surfaces
+  for the query, not a comprehensive archive search. Coverage and
+  recall will vary company to company.
+- No full article text — only title, link, publish date, and (when
+  present) source name. To read a full article you'd need to follow
+  the URL and scrape it separately.
+- The `when:Nd` search operator restricts results to roughly the last
+  N days, mirroring the same "catch anything breaking right now"
+  framing as before — not a historical audit.
 - Most small food/beverage SMEs simply won't have any news coverage in
-  a given 30-day window — an empty result is the EXPECTED outcome for
-  the large majority of companies checked, not a sign of a bug.
+  a given window — an empty result is the EXPECTED outcome for the
+  large majority of companies checked, not a sign of a bug.
+- Google occasionally 429s or serves a CAPTCHA page to scripted
+  requests with no distinguishing User-Agent — a plain `requests.get`
+  works most of the time but isn't guaranteed. If you see repeated
+  empty/malformed results, check the raw response before assuming
+  "no coverage."
 
 Usage:
     from news_verifier import check_news_controversy
     news_result = check_news_controversy(company_name, anthropic_client)
 
-Requires NEWSAPI_KEY in the environment:
-    export NEWSAPI_KEY="..."
+No API key required.
 """
 
-import os
+import re
 import json
 import requests
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
-NEWSAPI_URL = "https://newsapi.org/v2/everything"
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 
-# Free tier only covers roughly the last month — stay safely within it.
+# Free/unofficial feed — stay conservative on the lookback window.
 DAYS_BACK = 29
 
 # Query focuses on negative/controversy signals specifically — see
 # module docstring for why positive press isn't included.
+# (Google's search syntax doesn't support NewsAPI-style '*' wildcards,
+# so "greenwash*" became the explicit terms below.)
 CONTROVERSY_TERMS = (
-    'greenwash* OR "greenwashing" OR "misleading claims" OR '
+    '(greenwashing OR "greenwashing" OR "misleading claims" OR '
     '"environmental violation" OR lawsuit OR sued OR fined OR fine OR '
-    'scandal OR "false advertising" OR "regulatory action"'
+    'scandal OR "false advertising" OR "regulatory action")'
 )
+
+REQUEST_HEADERS = {
+    # A plain requests default User-Agent is more likely to get an
+    # atypical/empty response from Google; a normal browser-ish UA
+    # is more reliable for this unofficial endpoint.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
 
 VERIFICATION_MODEL = "claude-sonnet-4-6"
 
@@ -76,56 +96,70 @@ Return ONLY valid JSON, no markdown fences, no other text, in this exact format:
 If no articles are genuinely relevant, return controversy_detected: false, an appropriate summary, and an empty flagged_articles list."""
 
 
-def search_company_news(company_name: str, days_back: int = DAYS_BACK, api_key: str = None) -> list[dict]:
+def _strip_html(text: str) -> str:
+    """Google's RSS <description> field is often an HTML snippet
+    (a link plus a font-colored source tag) rather than plain text."""
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = re.sub(r"&nbsp;", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def search_company_news(company_name: str, days_back: int = DAYS_BACK, timeout: int = 15) -> list[dict]:
     """
-    Searches NewsAPI for recent articles mentioning the company name
-    alongside controversy-related terms.
+    Searches Google News RSS for recent articles mentioning the
+    company name alongside controversy-related terms.
 
     Returns a list of {"title", "description", "url", "source", "publishedAt"}
     dicts, or an empty list on failure / no results.
     """
-    key = api_key or NEWSAPI_KEY
-    if not key:
-        print("  [WARN] NEWSAPI_KEY not set — skipping news check.")
-        return []
-
-    query = f'"{company_name}" AND ({CONTROVERSY_TERMS})'
-    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-
+    query = f'"{company_name}" {CONTROVERSY_TERMS} when:{days_back}d'
     params = {
         "q": query,
-        "from": from_date,
-        "language": "en",
-        "sortBy": "publishedAt",
-        "pageSize": 20,
-        "apiKey": key,
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
     }
 
     try:
-        resp = requests.get(NEWSAPI_URL, params=params, timeout=15)
+        resp = requests.get(
+            GOOGLE_NEWS_RSS_URL,
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=timeout,
+        )
         resp.raise_for_status()
-        data = resp.json()
     except Exception as e:
-        print(f"  [WARN] NewsAPI request failed: {type(e).__name__} — {e}")
+        print(f"  [WARN] Google News RSS request failed: {type(e).__name__} — {e}")
         return []
 
-    if data.get("status") != "ok":
-        print(f"  [WARN] NewsAPI returned an error: {data.get('message', 'unknown error')}")
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        print(f"  [WARN] Could not parse Google News RSS response: {e}")
         return []
 
     articles = []
-    for a in data.get("articles", []):
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        description = _strip_html(item.findtext("description"))
+
+        source_el = item.find("source")
+        source = (source_el.text or "").strip() if source_el is not None else ""
+
         articles.append({
-            "title": a.get("title", ""),
-            "description": a.get("description", "") or "",
-            "url": a.get("url", ""),
-            "source": (a.get("source") or {}).get("name", ""),
-            "publishedAt": a.get("publishedAt", ""),
+            "title": title,
+            "description": description,
+            "url": link,
+            "source": source,
+            "publishedAt": pub_date,
         })
+
     return articles
 
 
-def check_news_controversy(company_name: str, anthropic_client, api_key: str = None, verbose: bool = True) -> dict:
+def check_news_controversy(company_name: str, anthropic_client, days_back: int = DAYS_BACK, verbose: bool = True) -> dict:
     """
     Stage entry point: searches for recent negative news coverage and
     uses Claude to interpret whether any of it is genuinely relevant
@@ -134,7 +168,7 @@ def check_news_controversy(company_name: str, anthropic_client, api_key: str = N
     Args:
         company_name: company to check
         anthropic_client: an anthropic.Anthropic client instance
-        api_key: NewsAPI key override; defaults to NEWSAPI_KEY env var
+        days_back: lookback window in days (Google 'when:Nd' operator)
         verbose: whether to print progress to stdout
 
     Returns:
@@ -145,7 +179,7 @@ def check_news_controversy(company_name: str, anthropic_client, api_key: str = N
     if verbose:
         print(f"  Checking recent news for: {company_name}")
 
-    articles = search_company_news(company_name, api_key=api_key)
+    articles = search_company_news(company_name, days_back=days_back)
 
     empty_result = {
         "controversy_detected": False,
@@ -241,6 +275,7 @@ def append_news_sheet(excel_path, results: dict):
 
 
 if __name__ == "__main__":
+    import os
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
     for name in ["Danone", "Glenisk"]:
