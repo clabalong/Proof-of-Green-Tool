@@ -504,9 +504,11 @@ def write_excel(results: list[dict], output_path: Path):
         "Company Attributed", "Complete Claim", "Exclusion Reason", "GPT Notes",
         "Page URL", "Source File",
         "EMAS Verified", "EU Organic Verified", "B Corp Verified", "Bord Bia Verified",
-        "Biopartenaire Verified", "BioED Verified"
+        "Biopartenaire Verified", "BioED Verified",
+        "ECGT Label", "ECGT Rule Triggered", "ECGT Explanation", "ECGT Review Flag"
     ]
-    col_widths = [22, 16, 14, 60, 60, 10, 12, 14, 14, 20, 18, 14, 22, 45, 45, 25, 14, 16, 14, 15, 18, 14]
+    col_widths = [22, 16, 14, 60, 60, 10, 12, 14, 14, 20, 18, 14, 22, 45, 45, 25, 14, 16, 14, 15, 18, 14,
+                  12, 32, 55, 14]
 
     # Header row
     header_fill = PatternFill("solid", fgColor="2C3E50")
@@ -559,6 +561,10 @@ def write_excel(results: list[dict], output_path: Path):
                 _yn("bordbia_verified"),
                 _yn("biopartenaire_verified"),
                 _yn("bioed_verified"),
+                c.get("ecgt_label", ""),
+                c.get("ecgt_rule_triggered", ""),
+                c.get("ecgt_explanation", ""),
+                _yn("ecgt_review_flag"),
             ]
             for col_idx, val in enumerate(values, 1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=val)
