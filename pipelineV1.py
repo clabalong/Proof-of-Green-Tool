@@ -21,14 +21,25 @@
      Stage 3 ────────────┼─> merge -> Stage 4
      News check ─────────┘  (independent, just runs alongside)
 
+ COUNTRY (optional 3rd argument): lets you tell Stage 3 exactly which
+ country to check for EMAS/EU Organic, instead of guessing from the
+ domain's TLD. Not mandatory — if omitted, falls back to the existing
+ TLD-guess behavior (all four panel countries if the TLD is ambiguous,
+ e.g. .com/.bio). Worth supplying whenever you already know the real
+ country, since guessing wrong on a .com domain means checking all
+ four countries instead of one.
+
  This is what the live tool's dashboard backend should call.
 
  CLI usage:
      python pipelineV1.py https://glenisk.com "Glenisk"
+     python pipelineV1.py https://glenisk.com "Glenisk" "Ireland"
 
  Programmatic usage:
      from pipelineV1 import run_pipeline
-     claims_result, cert_result, ecgt_result, news_result, excel_path = run_pipeline(url, company_name)
+     claims_result, cert_result, ecgt_result, news_result, excel_path = run_pipeline(
+         url, company_name, countries=["Ireland"]
+     )
 
  Requires ANTHROPIC_API_KEY and OPENAI_API_KEY to be set in the
  environment (used by Stage 1's LLM link classification, Stage 2's
@@ -59,7 +70,8 @@ from ecgt_pipeline_stage4 import run_ecgt_classification_stage
 from news_verifier import check_news_controversy, append_news_sheet
 
 
-def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_verifier=None):
+def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_verifier=None,
+                  countries: list = None):
     """
     Runs Stage 1 (scrape) -> Stage 2 (claim extraction + GPT verification)
     IN PARALLEL with Stage 3 (certification check) and the news
@@ -80,6 +92,15 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
                         multiple calls (recommended for batch runs, so
                         EMAS/EU Organic country data is fetched once, not
                         once per company). A new one is created if not given.
+        countries: explicit list of countries to check for EMAS/EU Organic
+                   (e.g. ["Ireland"]). NOT mandatory — if omitted (or
+                   empty), Stage 3 falls back to guessing from the URL's
+                   domain TLD, exactly as before. Supplying this skips
+                   that guess entirely — worth doing whenever the real
+                   country is already known, since an ambiguous TLD
+                   (.com, .bio, etc.) falls back to checking all four
+                   panel countries, which is slower (EU Organic paginates
+                   per country).
 
     Returns:
         (claims_result, cert_result, ecgt_result, news_result, excel_path) tuple
@@ -121,23 +142,22 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
         return scrape_result, json_path, claims_result
 
     def _run_cert_check():
-        if verbose:
-            print(f"\n{'#'*60}\n# STAGE 3 — CERTIFICATION CHECK (running in parallel with Stage 1/2)\n{'#'*60}")
+        # verbose=False here specifically to avoid interleaving with
+        # Stage 1/2's step-by-step output while both run concurrently —
+        # a clean one-line summary prints below once this finishes.
         return run_certification_stage(
-            company_name, company_url=url, verifier=cert_verifier, verbose=verbose
+            company_name, countries=countries, company_url=url,
+            verifier=cert_verifier, verbose=False
         )
 
     def _run_news_check():
-        if verbose:
-            print(f"\n{'#'*60}\n# NEWS CONTROVERSY CHECK (running in parallel with Stage 1/2)\n{'#'*60}")
-        return check_news_controversy(company_name, anthropic_client, verbose=verbose)
+        # Same reasoning as _run_cert_check above.
+        return check_news_controversy(company_name, anthropic_client, verbose=False)
 
     # Stage 3 and the news check need only company_name/url, so they run
     # concurrently with the Stage 1 -> Stage 2 chain rather than after it.
-    # NOTE: with verbose=True, output from all three interleaves in the
-    # terminal since they print concurrently — a known, accepted tradeoff
-    # for the faster total runtime. Each line is still prefixed with which
-    # stage it's from, so it's readable, just not perfectly sequential.
+    if verbose:
+        print(f"\n{'#'*60}\n# STAGE 1/2 RUNNING — STAGE 3 AND NEWS CHECK IN PARALLEL (quiet)\n{'#'*60}")
     with ThreadPoolExecutor(max_workers=3) as executor:
         scrape_extract_future = executor.submit(_run_scrape_and_extract)
         cert_future = executor.submit(_run_cert_check)
@@ -146,6 +166,13 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
         scrape_result, json_path, claims_result = scrape_extract_future.result()
         cert_result = cert_future.result()
         news_result = news_future.result()
+
+    if verbose:
+        matched_registries = [r for r, info in cert_result.items() if info["matched"]]
+        print(f"  Stage 3 (certifications) done: "
+              f"{', '.join(matched_registries) if matched_registries else 'none matched'}")
+        news_status = "controversy detected" if news_result.get("controversy_detected") else "no relevant coverage"
+        print(f"  News check done: {news_result.get('articles_found', 0)} article(s) found -> {news_status}")
 
     merge_certifications_into_claims(claims_result, cert_result)
 
@@ -190,9 +217,18 @@ def _parse_args():
         default=None,
         help="Optional company display name (derived from domain if omitted)",
     )
+    parser.add_argument(
+        "country",
+        nargs="?",
+        default=None,
+        help="Optional country for the certification check (e.g. Ireland). "
+             "NOT mandatory — if omitted, Stage 3 falls back to guessing "
+             "from the URL's domain TLD, same as before.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    run_pipeline(args.url, args.company_name)
+    countries_arg = [args.country] if args.country else None
+    run_pipeline(args.url, args.company_name, countries=countries_arg)
