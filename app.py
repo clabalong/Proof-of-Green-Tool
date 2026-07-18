@@ -615,6 +615,58 @@ view = st.sidebar.radio("View", ["SME Owner", "Procurement Manager"])
 st.sidebar.caption(f"{len(companies)} compan{'y' if len(companies)==1 else 'ies'} loaded "
                     f"({len(glob.glob(FILE_PATTERN))} files)")
 
+st.sidebar.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
+with st.sidebar.expander("➕ Run pipeline on a new company"):
+    new_url = st.text_input("Website URL", key="new_url", placeholder="https://example.com")
+    new_company_name = st.text_input("Company name", key="new_company_name", placeholder="")
+    st.caption("Optional — derived from the URL if left blank, but recommended for accuracy.")
+    new_country = st.text_input("Country", key="new_country", placeholder="")
+    st.caption("Optional — improves certification-check accuracy over guessing from the "
+                "domain (e.g. .com/.bio give no country hint on their own).")
+
+    if st.button("▶ Run Pipeline", key="run_pipeline_btn", type="primary", use_container_width=True):
+        if not new_url.strip():
+            st.error("Website URL is required.")
+        elif not os.environ.get("ANTHROPIC_API_KEY") or not os.environ.get("OPENAI_API_KEY"):
+            # Checked BEFORE calling run_pipeline() on purpose: that function
+            # calls sys.exit(1) if these are missing, which would kill the
+            # whole Streamlit server process, not just show an error here.
+            st.error("ANTHROPIC_API_KEY and/or OPENAI_API_KEY not set in the "
+                        "environment this app is running in. Set them the same "
+                        "way you would to run the pipeline from the command line, "
+                        "then restart the app.")
+        else:
+            # Imported here, not at module load time, so a problem with any
+            # pipeline dependency (Playwright, cert/news verifier modules,
+            # etc.) can't break the rest of the dashboard for someone who
+            # never uses this feature.
+            try:
+                from pipelineV1 import run_pipeline
+            except Exception as e:
+                st.error(f"Could not import pipelineV1: {e}")
+                st.stop()
+
+            with st.spinner(f"Running full pipeline for {new_company_name or new_url} — "
+                             f"this typically takes 10-15 minutes, please don't close this tab..."):
+                try:
+                    countries = [new_country.strip()] if new_country.strip() else None
+                    result = run_pipeline(
+                        new_url.strip(),
+                        new_company_name.strip() or None,
+                        countries=countries,
+                        verbose=False,
+                    )
+                    _, _, ecgt_result, news_result, excel_path = result
+                except Exception as e:
+                    st.error(f"Pipeline run failed: {e}")
+                    st.stop()
+
+            st.success(f"Done — saved to {excel_path}. "
+                        f"ECGT labels: {ecgt_result['label_distribution']}")
+            load_data.clear()
+            load_news_data.clear()
+            st.rerun()
+
 sub = df[df["Company"] == company]
 
 if view == "SME Owner":
