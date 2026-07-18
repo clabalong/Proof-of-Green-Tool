@@ -30,12 +30,22 @@
 
 import glob
 import hashlib
+import io
+import os
 import sqlite3
 from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from anthropic import Anthropic
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+)
 
 st.set_page_config(page_title="Proof of Green", page_icon="🌱", layout="wide")
 
@@ -149,6 +159,27 @@ def load_data(pattern: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data
+def load_news_data(pattern: str) -> pd.DataFrame:
+    """News Check is a separate sheet, one row per company normally, but
+    MULTIPLE rows per company when controversy is detected (one row per
+    flagged article — see news_verifier.py's append_news_sheet). Older
+    pipeline runs may not have this sheet at all, so missing it entirely
+    for a given file is expected, not an error worth warning about."""
+    files = glob.glob(pattern)
+    if not files:
+        return pd.DataFrame()
+    frames = []
+    for f in files:
+        try:
+            frames.append(pd.read_excel(f, sheet_name="News Check"))
+        except Exception:
+            pass  # sheet genuinely absent on older runs — silently skip
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 # ------------------------------
 # Local persistence (SQLite)
 # ------------------------------
@@ -160,6 +191,13 @@ def get_db():
             claim_id TEXT PRIMARY KEY,
             decision TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_summaries (
+            company TEXT PRIMARY KEY,
+            summary TEXT NOT NULL,
+            generated_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -181,8 +219,194 @@ def set_decision(conn, cid: str, decision: str):
     conn.commit()
 
 
+def get_ai_summary(conn, company: str):
+    row = conn.execute(
+        "SELECT summary, generated_at FROM ai_summaries WHERE company = ?", (company,)
+    ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def set_ai_summary(conn, company: str, summary: str):
+    conn.execute(
+        """INSERT INTO ai_summaries (company, summary, generated_at) VALUES (?, ?, ?)
+           ON CONFLICT(company) DO UPDATE SET summary = excluded.summary,
+                                               generated_at = excluded.generated_at""",
+        (company, summary, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def generate_ai_summary(company: str, sub: pd.DataFrame, news_row) -> str:
+    """On-demand executive summary — a single live API call, made only
+    when the user clicks the button, NOT part of the pipeline. Uses only
+    data already computed (RAG counts, registry status, existing claim
+    explanations); does not re-classify anything."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return ("ERROR: ANTHROPIC_API_KEY not set in environment. "
+                "Set it the same way you would for the pipeline itself.")
+
+    total = len(sub)
+    red = int((sub["ECGT Label"] == "RED").sum())
+    amber = int((sub["ECGT Label"] == "AMBER").sum())
+    green = int((sub["ECGT Label"] == "GREEN").sum())
+    gap_score = red / total if total else 0
+
+    confirmed = [label for col, label in REGISTRY_COLS if _is_yes(sub[col].iloc[0])
+                 if col in sub.columns and len(sub)]
+    registry_text = ", ".join(confirmed) if confirmed else "None confirmed"
+
+    news_text = safe_str(news_row.get("Summary"), "No news check data available.") \
+        if news_row is not None else "No news check data available."
+
+    red_claims = sub[sub["ECGT Label"] == "RED"]
+    red_text = "\n".join(
+        f'- "{safe_str(r.get("Verbatim Claim"))[:150]}" — {safe_str(r.get("ECGT Explanation"))}'
+        for _, r in red_claims.head(8).iterrows()
+    ) or "None."
+
+    amber_claims = sub[sub["ECGT Label"] == "AMBER"]
+    amber_text = "\n".join(
+        f'- "{safe_str(r.get("Verbatim Claim"))[:150]}" — {safe_str(r.get("ECGT Explanation"))}'
+        for _, r in amber_claims.head(8).iterrows()
+    ) or "None."
+
+    prompt = f"""You are writing a concise executive summary for a supplier
+due-diligence brief, for a procurement manager reviewing this company's
+environmental marketing claims under EU Directive 2024/825 (ECGT).
+
+Company: {company}
+Total claims analysed: {total}
+Compliant (GREEN): {green} ({green/total:.0%} of total)
+Needs attention (AMBER): {amber} ({amber/total:.0%} of total)
+Violations (RED): {red} ({red/total:.0%} of total)
+Gap Score (RED / total): {gap_score:.0%}
+
+Registries confirmed: {registry_text}
+
+News coverage summary: {news_text}
+
+RED (likely non-compliant) claims found:
+{red_text}
+
+AMBER (needs evidence) claims found:
+{amber_text}
+
+Write a concise 2-paragraph executive summary (roughly half the length
+of a full brief) suitable for a procurement due-diligence file. First
+paragraph: overall compliance posture and the single most significant
+concern, citing one concrete example from the RED/AMBER claims above.
+Second paragraph: whether the confirmed certifications provide
+meaningful assurance given what they actually cover, and a
+plain-language procurement recommendation. Write in a neutral,
+professional, factual tone appropriate for a compliance record — no
+marketing language, no hedging beyond what the data supports. Do not
+state any fact not given above."""
+
+    try:
+        client = Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=450,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        return f"ERROR generating summary: {e}"
+
+
+def build_pdf_brief(company: str, sub: pd.DataFrame, news_row, ai_summary: str) -> bytes:
+    """Assembles a due-diligence brief PDF from data already computed —
+    no new classification, no re-running the pipeline. AI summary is
+    optional and passed in already-generated (or None)."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             topMargin=2*cm, bottomMargin=2*cm,
+                             leftMargin=2*cm, rightMargin=2*cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("BriefTitle", parent=styles["Title"], fontSize=20)
+    h2 = ParagraphStyle("BriefH2", parent=styles["Heading2"], spaceBefore=14, spaceAfter=6)
+    body = styles["BodyText"]
+    small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=9, textColor=colors.grey)
+
+    total = len(sub)
+    red = int((sub["ECGT Label"] == "RED").sum())
+    amber = int((sub["ECGT Label"] == "AMBER").sum())
+    green = int((sub["ECGT Label"] == "GREEN").sum())
+    gap_score = red / total if total else 0
+
+    story = []
+    story.append(Paragraph("Proof of Green — Due Diligence Brief", title_style))
+    story.append(Paragraph(company, styles["Heading1"]))
+    story.append(Paragraph(
+        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+        f"{total} claims analysed", small))
+    story.append(Spacer(1, 0.5*cm))
+
+    stats_table = Table(
+        [["Total", "GREEN", "AMBER", "RED", "Gap Score"],
+         [str(total), str(green), str(amber), str(red), f"{gap_score:.0%}"]],
+        colWidths=[3*cm]*5,
+    )
+    stats_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1A2540")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(stats_table)
+    story.append(Spacer(1, 0.5*cm))
+
+    if ai_summary and not ai_summary.startswith("ERROR"):
+        story.append(Paragraph("Executive Summary", h2))
+        for para in ai_summary.split("\n\n"):
+            if para.strip():
+                story.append(Paragraph(para.strip(), body))
+                story.append(Spacer(1, 0.2*cm))
+
+    story.append(Paragraph("Registry Verification", h2))
+    confirmed = [label for col, label in REGISTRY_COLS if _is_yes(sub[col].iloc[0])
+                 if col in sub.columns and len(sub)]
+    story.append(Paragraph(
+        ", ".join(confirmed) if confirmed else "No registries confirmed.", body))
+
+    story.append(Paragraph("News Coverage", h2))
+    news_text = safe_str(news_row.get("Summary"), "No news check data available.") \
+        if news_row is not None else "No news check data available."
+    story.append(Paragraph(news_text, body))
+
+    story.append(PageBreak())
+    story.append(Paragraph("RED Claims (Likely Non-Compliant)", h2))
+    red_claims = sub[sub["ECGT Label"] == "RED"]
+    if red_claims.empty:
+        story.append(Paragraph("None.", body))
+    else:
+        for _, r in red_claims.iterrows():
+            story.append(Paragraph(f'<b>Claim:</b> {safe_str(r.get("Verbatim Claim"))}', body))
+            story.append(Paragraph(f'<b>Article:</b> {safe_str(r.get("ECGT Citation"))}', body))
+            story.append(Paragraph(f'<b>Explanation:</b> {safe_str(r.get("ECGT Explanation"))}', body))
+            story.append(Spacer(1, 0.3*cm))
+
+    story.append(Paragraph("AMBER Claims (Needs Evidence)", h2))
+    amber_claims = sub[sub["ECGT Label"] == "AMBER"]
+    if amber_claims.empty:
+        story.append(Paragraph("None.", body))
+    else:
+        for _, r in amber_claims.iterrows():
+            story.append(Paragraph(f'<b>Claim:</b> {safe_str(r.get("Verbatim Claim"))}', body))
+            story.append(Paragraph(f'<b>Article:</b> {safe_str(r.get("ECGT Citation"))}', body))
+            story.append(Paragraph(f'<b>Guidance:</b> {safe_str(r.get("ECGT Guidance"))}', body))
+            story.append(Paragraph(f'<b>Explanation:</b> {safe_str(r.get("ECGT Explanation"))}', body))
+            story.append(Spacer(1, 0.3*cm))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
 def registry_summary(row) -> str:
     confirmed = [label for col, label in REGISTRY_COLS if _is_yes(row.get(col))]
+
     return ", ".join(confirmed) if confirmed else "None confirmed"
 
 
@@ -367,6 +591,7 @@ def claim_row(row, conn):
 # Load data + DB
 # ------------------------------
 df = load_data(FILE_PATTERN)
+news_df = load_news_data(FILE_PATTERN)
 conn = get_db()
 
 if df.empty:
@@ -467,6 +692,45 @@ elif view == "Procurement Manager":
     st.caption(f"{company} — supplier due diligence")
 
     gap_score = (sub["ECGT Label"] == "RED").sum() / len(sub) if len(sub) else 0
+    company_news = news_df[news_df["Company"] == company] if not news_df.empty else pd.DataFrame()
+    news_row = company_news.iloc[0] if not company_news.empty else None
+
+    st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+    st.subheader("Due Diligence Brief")
+    ai_summary, ai_generated_at = get_ai_summary(conn, company)
+
+    ai_col1, ai_col2 = st.columns([1, 1])
+    with ai_col1:
+        btn_label = "🔄 Regenerate AI Summary" if ai_summary else "✨ Generate AI Summary"
+        if st.button(btn_label, key=f"gen_summary_{company}"):
+            with st.spinner("Generating executive summary..."):
+                new_summary = generate_ai_summary(company, sub, news_row)
+                set_ai_summary(conn, company, new_summary)
+            st.rerun()
+    with ai_col2:
+        pdf_bytes = build_pdf_brief(company, sub, news_row, ai_summary)
+        st.download_button(
+            "⬇ Download Brief (PDF)", data=pdf_bytes,
+            file_name=f"{company.replace(' ', '_')}_due_diligence_brief.pdf",
+            mime="application/pdf", key=f"download_brief_{company}",
+        )
+
+    if ai_summary:
+        if ai_summary.startswith("ERROR"):
+            st.error(ai_summary)
+        else:
+            st.markdown(f"""
+            <div style="background:#1A2540; border:1px solid #26365C; border-radius:8px;
+                        padding:14px 18px; margin-top:10px;">
+                {ai_summary.replace(chr(10)+chr(10), '<br><br>')}
+            </div>
+            """, unsafe_allow_html=True)
+            st.caption(f"Generated {ai_generated_at}")
+    else:
+        st.caption("No AI summary generated yet for this company — click above to generate one, "
+                    "or download the brief without it (structured data only).")
+
+    st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
 
     g1, g2 = st.columns([1, 2])
     with g1:
@@ -548,6 +812,52 @@ elif view == "Procurement Manager":
         )
         st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
         st.caption(f"Currently viewing: {company} (highlighted)")
+
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+    st.subheader("News Coverage")
+
+    if company_news.empty:
+        st.caption("No news check data available for this company "
+                    "(older pipeline run, or news check was skipped).")
+    else:
+        # First row carries the company-level summary regardless of how
+        # many rows exist (one row per flagged article when controversy
+        # is detected — see news_verifier.py's append_news_sheet).
+        first = news_row
+        controversy = _is_yes(first.get("Controversy Detected"))
+
+        if controversy:
+            html_block(f"""
+            <div style="background:{LABEL_BG['RED']}; border-left:4px solid {LABEL_COLOR['RED']};
+                        border-radius:8px; padding:12px 16px; margin-bottom:10px;">
+                <div style="color:{LABEL_COLOR['RED']}; font-weight:700; font-size:13px;">
+                    ⚠ Controversy detected
+                </div>
+                <div style="color:#C7D0DE; font-size:13px; margin-top:4px;">{safe_str(first.get('Summary'))}</div>
+            </div>
+            """)
+            # Flagged Article/URL/Reason are per-row when controversy=Yes;
+            # NaN-check each field individually since a row could have a
+            # partial fill.
+            flagged_rows = company_news[company_news["Flagged Article"].notna()] \
+                if "Flagged Article" in company_news.columns else pd.DataFrame()
+            for _, frow in flagged_rows.iterrows():
+                st.markdown(f"**{safe_str(frow.get('Flagged Article'))}**")
+                url = safe_str(frow.get("URL"), "")
+                if url:
+                    st.markdown(f"[{url}]({url})")
+                st.markdown(f"*{safe_str(frow.get('Reason'))}*")
+                st.markdown("---")
+        else:
+            html_block(f"""
+            <div style="background:{LABEL_BG['GREEN']}; border-left:4px solid {LABEL_COLOR['GREEN']};
+                        border-radius:8px; padding:12px 16px;">
+                <div style="color:{LABEL_COLOR['GREEN']}; font-weight:700; font-size:13px;">
+                    ✓ No controversy detected
+                </div>
+                <div style="color:#C7D0DE; font-size:13px; margin-top:4px;">{safe_str(first.get('Summary'))}</div>
+            </div>
+            """)
 
     st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
     st.subheader("AMBER Claims — Needs Evidence")
