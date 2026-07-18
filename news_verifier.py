@@ -20,8 +20,9 @@ IMPORTANT LIMITATIONS (Google News RSS):
   present) source name. To read a full article you'd need to follow
   the URL and scrape it separately.
 - The `when:Nd` search operator restricts results to roughly the last
-  N days, mirroring the same "catch anything breaking right now"
-  framing as before — not a historical audit.
+  N days (set to a year by default here — Google's `when:` operator
+  supports arbitrary day counts, not just short windows; this is NOT
+  the same 30-day hard limit NewsAPI's free tier had).
 - Most small food/beverage SMEs simply won't have any news coverage in
   a given window — an empty result is the EXPECTED outcome for the
   large majority of companies checked, not a sign of a bug.
@@ -46,8 +47,10 @@ from urllib.parse import quote
 
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 
-# Free/unofficial feed — stay conservative on the lookback window.
-DAYS_BACK = 29
+# A full year lookback — Google's when: operator supports arbitrary day
+# counts (when:365d), unlike NewsAPI's free tier which hard-capped at
+# ~30 days regardless of what you asked for.
+DAYS_BACK = 365
 
 # Query focuses on negative/controversy signals specifically — see
 # module docstring for why positive press isn't included.
@@ -183,7 +186,7 @@ def check_news_controversy(company_name: str, anthropic_client, days_back: int =
 
     empty_result = {
         "controversy_detected": False,
-        "summary": "No articles found in the last month" if not articles else "",
+        "summary": "No articles found in the lookback window" if not articles else "",
         "flagged_articles": [],
         "articles_found": len(articles),
     }
