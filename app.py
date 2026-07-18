@@ -646,8 +646,13 @@ with st.sidebar.expander("➕ Run pipeline on a new company"):
                 st.error(f"Could not import pipelineV1: {e}")
                 st.stop()
 
-            with st.spinner(f"Running full pipeline for {new_company_name or new_url} — "
-                             f"this typically takes 10-15 minutes, please don't close this tab..."):
+            label = new_company_name.strip() or new_url.strip()
+            with st.status(f"Running pipeline for {label}...", expanded=True) as status:
+                status.write("This typically takes 10-15 minutes — please don't close this tab.")
+
+                def _on_progress(msg, _status=status):
+                    _status.write(msg)
+
                 try:
                     countries = [new_country.strip()] if new_country.strip() else None
                     result = run_pipeline(
@@ -655,11 +660,14 @@ with st.sidebar.expander("➕ Run pipeline on a new company"):
                         new_company_name.strip() or None,
                         countries=countries,
                         verbose=False,
+                        on_progress=_on_progress,
                     )
                     _, _, ecgt_result, news_result, excel_path = result
                 except Exception as e:
-                    st.error(f"Pipeline run failed: {e}")
+                    status.update(label=f"Failed: {e}", state="error")
                     st.stop()
+
+                status.update(label="Pipeline complete!", state="complete")
 
             st.success(f"Done — saved to {excel_path}. "
                         f"ECGT labels: {ecgt_result['label_distribution']}")

@@ -38,8 +38,19 @@
  Programmatic usage:
      from pipelineV1 import run_pipeline
      claims_result, cert_result, ecgt_result, news_result, excel_path = run_pipeline(
-         url, company_name, countries=["Ireland"]
+         url, company_name, countries=["Ireland"],
+         on_progress=lambda msg: print(f"[progress] {msg}")
      )
+
+ on_progress (optional): a callback taking a single short status string,
+ called at each real stage TRANSITION — not a smooth/continuous progress
+ bar, an honest "here's what's actually happening now." Because Stage 3
+ (certification) and the news check run concurrently with the Stage 1/2
+ chain, progress for those three is reported in whichever order they
+ ACTUALLY finish (via concurrent.futures.as_completed), not a fixed
+ assumed sequence — so don't assume "certification done" always arrives
+ before "scraping done." A broken callback (e.g. a UI update that raises)
+ is caught and ignored so it can never break the actual pipeline run.
 
  Requires ANTHROPIC_API_KEY and OPENAI_API_KEY to be set in the
  environment (used by Stage 1's LLM link classification, Stage 2's
@@ -56,7 +67,7 @@
 import argparse
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -71,7 +82,7 @@ from news_verifier import check_news_controversy, append_news_sheet
 
 
 def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_verifier=None,
-                  countries: list = None):
+                  countries: list = None, on_progress=None):
     """
     Runs Stage 1 (scrape) -> Stage 2 (claim extraction + GPT verification)
     IN PARALLEL with Stage 3 (certification check) and the news
@@ -101,10 +112,21 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
                    (.com, .bio, etc.) falls back to checking all four
                    panel countries, which is slower (EU Organic paginates
                    per country).
+        on_progress: optional callback(str) called at each real stage
+                     transition — see module docstring above for the
+                     important caveat about parallel-stage ordering.
 
     Returns:
         (claims_result, cert_result, ecgt_result, news_result, excel_path) tuple
     """
+    def _progress(message: str):
+        if on_progress is None:
+            return
+        try:
+            on_progress(message)
+        except Exception:
+            pass  # a broken callback must never break the actual pipeline run
+
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if not anthropic_key:
         print("[ERROR] ANTHROPIC_API_KEY environment variable not set.")
@@ -158,14 +180,33 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
     # concurrently with the Stage 1 -> Stage 2 chain rather than after it.
     if verbose:
         print(f"\n{'#'*60}\n# STAGE 1/2 RUNNING — STAGE 3 AND NEWS CHECK IN PARALLEL (quiet)\n{'#'*60}")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        scrape_extract_future = executor.submit(_run_scrape_and_extract)
-        cert_future = executor.submit(_run_cert_check)
-        news_future = executor.submit(_run_news_check)
+    _progress("Scraping, extracting claims, checking certifications, and checking "
+               "news coverage — running in parallel...")
 
-        scrape_result, json_path, claims_result = scrape_extract_future.result()
-        cert_result = cert_future.result()
-        news_result = news_future.result()
+    _LABELS = {
+        "scrape_extract": "Scraping & claim extraction",
+        "cert": "Certification check",
+        "news": "News check",
+    }
+    results = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_label = {
+            executor.submit(_run_scrape_and_extract): "scrape_extract",
+            executor.submit(_run_cert_check): "cert",
+            executor.submit(_run_news_check): "news",
+        }
+        # Report each task's completion in whichever order it ACTUALLY
+        # finishes — as_completed yields futures as they resolve, not in
+        # submission order, so this stays honest about real concurrency
+        # rather than assuming a fixed sequence.
+        for future in as_completed(future_to_label):
+            label = future_to_label[future]
+            results[label] = future.result()
+            _progress(f"{_LABELS[label]} complete.")
+
+    scrape_result, json_path, claims_result = results["scrape_extract"]
+    cert_result = results["cert"]
+    news_result = results["news"]
 
     if verbose:
         matched_registries = [r for r, info in cert_result.items() if info["matched"]]
@@ -181,14 +222,17 @@ def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_
     # fully done — no parallelization opportunity here.
     if verbose:
         print(f"\n{'#'*60}\n# STAGE 4 — ECGT CLASSIFICATION\n{'#'*60}")
+    _progress("Running ECGT classification (Stage 4)...")
     ecgt_result = run_ecgt_classification_stage(claims_result, anthropic_client, verbose=verbose)
 
+    _progress("Classification complete — saving output...")
     safe_name = scrape_result["company_name"].lower().replace(" ", "_")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     excel_path = Path(f"greenlens_claims_{safe_name}_{timestamp}.xlsx")
     write_excel([claims_result], excel_path)
     append_certifications_sheet(excel_path, {scrape_result["company_name"]: cert_result})
     append_news_sheet(excel_path, {scrape_result["company_name"]: news_result})
+    _progress(f"Done — saved to {excel_path}.")
 
     if verbose:
         print(f"\n{'='*60}")
