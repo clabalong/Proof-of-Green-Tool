@@ -63,6 +63,7 @@
 import os
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import json_repair
 from anthropic import Anthropic
@@ -84,6 +85,15 @@ STEP_A_RETRIES = 3   # thin retry wrapper around classify_one — does not
                       # touch classify_one's internals, so the decision
                       # procedure itself stays byte-identical; only
                       # transient API failures get retried.
+
+# How many claims to classify concurrently in run_ecgt_classification_stage()
+# (the live-pipeline path). Each claim's Step A + Step B sequence is fully
+# independent of every other claim's, so this is safe — it does not touch
+# classify_one()/explain_claim()'s internals, just runs more of the same
+# unchanged per-claim procedure at once. Tune down if you see 429 rate-limit
+# errors; bounded concurrency is a better throttle than the fixed per-call
+# sleeps below, which the standalone batch mode (run()) still uses.
+CLASSIFICATION_MAX_WORKERS = 6
 
 # Citation reference table — the 8 rules from EU_Directive_2024_825_Rulings.json
 # that are actually in scope for food-SME environmental claims (the other 10,
@@ -262,12 +272,45 @@ exact format:
         }
 
 
+def _classify_and_explain_one(anthropic_client: Anthropic, claim: dict) -> tuple[dict, str, dict]:
+    """
+    Runs the EXACT same Step A -> Step B sequence as before for one
+    claim, unchanged. This is the unit of work parallelized across
+    claims in run_ecgt_classification_stage() — nothing about the
+    classification procedure itself differs from the original
+    sequential version; only the number of claims in flight at once
+    changes.
+    """
+    registry = build_registry_summary(claim)
+    category = str(claim.get("category") or "general")
+    text = str(claim.get("text", ""))
+
+    # STEP A — the decision, unchanged, validated procedure
+    label = classify_one_with_retry(anthropic_client, text, registry, category)
+
+    # STEP B — explanation only, cannot revise the label above
+    if label in ("RED", "AMBER", "GREEN"):
+        info = explain_claim(anthropic_client, text, registry, category, label)
+    else:
+        info = {"rule_triggered": "N/A", "citation": "N/A", "explanation":
+                 "Step A classification failed or returned UNKNOWN.",
+                 "guidance": "N/A", "review_flag": True}
+
+    return claim, label, info
+
+
 def run_ecgt_classification_stage(claims_result: dict, anthropic_client: Anthropic,
-                                   verbose: bool = True) -> dict:
+                                   verbose: bool = True,
+                                   max_workers: int = CLASSIFICATION_MAX_WORKERS) -> dict:
     """
     Stage 4 entry point for pipelineV1.py. Runs AFTER Stage 3
     (merge_certifications_into_claims must already have populated the
     six *_verified fields on each claim in claims_result["claims"]).
+
+    Classifies claims CONCURRENTLY (up to max_workers at once) rather
+    than one at a time — each claim's Step A + Step B sequence is
+    completely independent of every other claim's, so this changes
+    only the scheduling, not the classification procedure itself.
 
     Mutates claims_result["claims"] in place, adding six fields to
     each claim dict: "ecgt_label", "ecgt_rule_triggered",
@@ -280,8 +323,13 @@ def run_ecgt_classification_stage(claims_result: dict, anthropic_client: Anthrop
                         and already updated by merge_certifications_into_claims()
         anthropic_client: an anthropic.Anthropic client instance
                            (reuse the one already created in pipelineV1.py —
-                           no separate API key handling needed here)
+                           no separate API key handling needed here; the
+                           Anthropic SDK's client is safe to share across
+                           threads for concurrent requests)
         verbose: whether to print progress to stdout
+        max_workers: how many claims to classify concurrently (default
+                      CLASSIFICATION_MAX_WORKERS). Reduce if you see
+                      429 rate-limit errors.
 
     Returns:
         dict summary: {"label_distribution": {...}, "review_flagged": int,
@@ -291,38 +339,34 @@ def run_ecgt_classification_stage(claims_result: dict, anthropic_client: Anthrop
     total = len(claims)
     label_counts = {"RED": 0, "AMBER": 0, "GREEN": 0, "ERROR": 0, "UNKNOWN": 0}
     review_flagged = 0
+    completed = 0
 
-    for i, claim in enumerate(claims, start=1):
-        registry = build_registry_summary(claim)
-        category = str(claim.get("category") or "general")
-        text = str(claim.get("text", ""))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_classify_and_explain_one, anthropic_client, claim)
+            for claim in claims
+        ]
+        # as_completed yields whichever finishes first — claims are NOT
+        # necessarily processed/reported in their original order, same
+        # tradeoff already accepted elsewhere in this pipeline
+        # (pipelineV1.py's Stage 3/news-check progress reporting).
+        for future in as_completed(futures):
+            claim, label, info = future.result()
 
-        # STEP A — the decision, unchanged, validated procedure
-        label = classify_one_with_retry(anthropic_client, text, registry, category)
-        time.sleep(DELAY)
+            claim["ecgt_label"] = label
+            claim["ecgt_rule_triggered"] = info["rule_triggered"]
+            claim["ecgt_citation"] = info["citation"]
+            claim["ecgt_explanation"] = info["explanation"]
+            claim["ecgt_guidance"] = info["guidance"]
+            claim["ecgt_review_flag"] = info["review_flag"]
 
-        # STEP B — explanation only, cannot revise the label above
-        if label in ("RED", "AMBER", "GREEN"):
-            info = explain_claim(anthropic_client, text, registry, category, label)
-        else:
-            info = {"rule_triggered": "N/A", "citation": "N/A", "explanation":
-                     "Step A classification failed or returned UNKNOWN.",
-                     "guidance": "N/A", "review_flag": True}
-        time.sleep(DELAY)
+            label_counts[label] = label_counts.get(label, 0) + 1
+            if info["review_flag"]:
+                review_flagged += 1
 
-        claim["ecgt_label"] = label
-        claim["ecgt_rule_triggered"] = info["rule_triggered"]
-        claim["ecgt_citation"] = info["citation"]
-        claim["ecgt_explanation"] = info["explanation"]
-        claim["ecgt_guidance"] = info["guidance"]
-        claim["ecgt_review_flag"] = info["review_flag"]
-
-        label_counts[label] = label_counts.get(label, 0) + 1
-        if info["review_flag"]:
-            review_flagged += 1
-
-        if verbose and (i % 10 == 0 or i == total):
-            print(f"  Classified {i}/{total}  (latest: {label})")
+            completed += 1
+            if verbose and (completed % 10 == 0 or completed == total):
+                print(f"  Classified {completed}/{total}  (latest: {label})")
 
     if verbose:
         print(f"  ECGT distribution: {label_counts}")
