@@ -4,7 +4,7 @@
 ================================================================
  Built against the real, updated pipeline output (Citation + Guidance
  fields now included — see ecgt_pipeline_stage4.py / extract_claims.py
- changes made earlier this session).
+ changes made earlier this session)..
 
  Design source: the dark navy/teal mockup image, matched as closely
  as Streamlit reasonably allows without a custom frontend. NOT yet
