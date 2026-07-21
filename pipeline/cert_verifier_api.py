@@ -108,7 +108,7 @@ def guess_country_from_url(url: str):
 # so this uses a pre-scraped local JSON cache instead of a live lookup —
 # same "fetch once, match locally" idea as EMAS/EU Organic, just backed
 # by a static file instead of a network call.
-BORDBIA_CACHE_PATH = "bordbia_members_cache.json"
+BORDBIA_CACHE_PATH = str(Path(__file__).resolve().parent.parent / "data" / "bordbia_members_cache.json")
 
 # Matches a domain anywhere in a string, with or without scheme/www,
 # and regardless of surrounding junk text (many cache entries are messy,

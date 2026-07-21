@@ -74,11 +74,11 @@ from pathlib import Path
 import anthropic
 import openai
 
-from data_collection import run_single_scrape, _derive_company_name
-from extract_claims import process_scrape_result, write_excel
-from cert_verifier_api import run_certification_stage, append_certifications_sheet, merge_certifications_into_claims
-from ecgt_pipeline_stage4 import run_ecgt_classification_stage
-from news_verifier import check_news_controversy, append_news_sheet
+from pipeline.data_collection import run_single_scrape, _derive_company_name
+from pipeline.extract_claims import process_scrape_result, write_excel
+from pipeline.cert_verifier_api import run_certification_stage, append_certifications_sheet, merge_certifications_into_claims
+from pipeline.ecgt_pipeline_stage4 import run_ecgt_classification_stage
+from pipeline.news_verifier import check_news_controversy, append_news_sheet
 
 
 def run_pipeline(url: str, company_name: str = None, verbose: bool = True, cert_verifier=None,

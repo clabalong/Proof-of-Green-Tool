@@ -20,8 +20,8 @@
 """
 
 import time
-from cert_verifier_api import CertVerifier, DEFAULT_COUNTRIES
-from pipelineV1 import run_pipeline
+from pipeline.cert_verifier_api import CertVerifier, DEFAULT_COUNTRIES
+from pipeline.pipelineV1 import run_pipeline
 
 # (url, company_name) — names match your original SME_SAMPLE list
 # exactly, not auto-derived from the domain (avoids the "Thehappypear"

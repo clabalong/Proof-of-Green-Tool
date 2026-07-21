@@ -69,7 +69,7 @@ import json_repair
 from anthropic import Anthropic
 
 # Import Step A completely unmodified — this is the validated procedure.
-from claude_classifier_tool import (
+from pipeline.claude_classifier_tool import (
     ECGT_RULES,
     classify_one,
     build_registry_summary,

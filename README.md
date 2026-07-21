@@ -1,41 +1,46 @@
-# GreenLens
+# Proof of Green
 
-**An AI pipeline for auditing EU food SME websites for greenwashing compliance against EU Directive 2024/825 (the "Empowering Consumers for the Green Transition" Directive, ECGT).**
+**An AI-powered green claims compliance tool: auditing EU food SME websites for greenwashing compliance against EU Directive 2024/825 (the "Empowering Consumers for the Green Transition" Directive, ECGT).**
 
 MSc Business Analytics capstone dissertation project, Trinity Business School, Trinity College Dublin, in collaboration with EY Ireland.
 
 - **Supervisor:** Dr. Baidyanath Biswas
-- **Team:** Tuna Erdem, Sundus, Yifei
-- **Deadline:** 24 July 2026
+- **Team:** Sundus Afreen, Tuna Cemal Erdem, Yifei Yu
+- **Submission:** July 2026
 
 ---
 
 ## What this does
 
-GreenLens takes a single EU SME's website URL and runs it through a multi-stage pipeline that:
+Proof of Green takes a single EU SME's website URL and runs it through a multi-stage pipeline that:
 
 1. **Scrapes** the company's homepage, About, Sustainability, and Products pages
 2. **Extracts** every environmental/sustainability claim made on those pages, using an LLM
 3. **Independently verifies** each extracted claim using a second, separate model
 4. **Cross-checks** the company against six real EU/national certification registries, to catch claimed certifications that can't be independently verified — a core greenwashing signal under ECGT
+5. **Classifies** every claim RED/AMBER/GREEN against ECGT compliance criteria, with a cited rule, plain-language explanation, remediation guidance, and a flag for claims that genuinely warrant human review
+6. **Checks recent news** for independent corroboration of environmental controversies (lawsuits, fines, greenwashing accusations) not visible from the company's own site
 
-The output is a single Excel workbook per company: every claim, its category, its confidence and verification status, and whether the company's claimed certifications actually check out.
-
+The output is a single Excel workbook per company: every claim, its category, verification status, certification cross-check results, RAG classification with rationale, and any relevant news findings. A Streamlit dashboard (`app.py`) sits on top of the pipeline for interactive use.
 
 ---
 
 ## Pipeline architecture
 
-Each stage lives in its own file and exposes one importable function, so the three of us can work on different stages without constant merge conflicts. `pipelineV1.py` is a thin orchestrator that imports and chains them together — it contains no scraping/extraction/verification logic itself.
+Each stage lives in its own file inside the `pipeline/` package and exposes one importable function, so the team can work on different stages without constant merge conflicts. `pipelineV1.py` is a thin orchestrator that imports and chains them together — it contains no scraping/extraction/verification/classification logic itself.
 
 ```
 Stage 1: data_collection.py       → scrapes the company website
 Stage 2: extract_claims.py        → extracts + verifies environmental claims
 Stage 3: cert_verifier_api.py     → checks 6 certification registries
-         pipelineV1.py            → chains Stages 1-3 for one company URL
+Stage 4: ecgt_pipeline_stage4.py  → RAG classification against ECGT rules
+         news_verifier.py         → recent-news corroboration check
+         pipelineV1.py            → chains everything for one company URL
 ```
 
-### Stage 1 — `data_collection.py`
+**Concurrency:** Stage 3 and the news check depend only on the company's name and URL — not on anything Stage 1 scrapes or Stage 2 extracts — so both run concurrently with the Stage 1→2 chain rather than waiting for it to finish. Stage 4 runs last, since it needs Stage 2's claims and Stage 3's certification results merged together first.
+
+### Stage 1 — `pipeline/data_collection.py`
 
 Scrapes a company's Homepage, About, Sustainability, and Products pages using Playwright.
 
@@ -45,63 +50,80 @@ Page discovery works in layers, since food SME site navigation varies enormously
 2. **Keyword matching + hub-child content verification** (fallback) — only runs for whatever the LLM pass didn't resolve. Includes multilingual keyword lists and a mechanism for finding thematically-organized sub-pages nested under a hub page (e.g. `/our-story/climate/`) via direct content verification rather than keyword guessing.
 3. **Guessed common paths** (last resort) — e.g. `/sustainability`, `/about-us`.
 
-Junk pages (privacy policy, cookie notices, cart, login, etc.) are filtered out at every stage via a URL blocklist.
+Junk pages (privacy policy, cookie notices, cart, login, etc.) are filtered out at every stage via a URL blocklist. Cookie-consent banners are dismissed via a combination of button-text matching and CSS selectors for common consent platforms (Complianz, Cookiebot, OneTrust, etc.).
 
-**Output:** one JSON file per company in `scraped_data/`, containing the scraped text and metadata for each page type, plus which discovery method resolved it (useful for the dissertation's methodology section — you can report what % of pages needed LLM-based vs. keyword-based discovery).
+**Output:** one JSON file per company in `scraped_data/`, containing the scraped text and metadata for each page type, plus which discovery method resolved it.
 
 **Key functions:**
 - `run_single_scrape(url, company_name=None)` → `(result_dict, json_filepath)`
 - `scrape_sme_website(base_url, company_name)` — the core scraper, callable directly if you don't need the JSON-saving wrapper
 
-### Stage 2 — `extract_claims.py`
+### Stage 2 — `pipeline/extract_claims.py`
 
-Reads a company's scraped pages and extracts every environmental/sustainability claim using Claude, then independently verifies each one using GPT-5.5 (a separate model/provider — not the same model checking its own work).
+Reads a company's scraped pages and extracts every environmental/sustainability claim using Claude, then independently verifies each one using a separate OpenAI model — a genuinely different provider, not the same model checking its own work.
 
 **Extraction categories:** carbon, biodiversity, packaging, water, sourcing, certification, waste, general.
 
-**Why a separate verification pass:** self-reported LLM confidence scores (asked for during the same generation pass as extraction) are a known-weak signal — models tend to be overconfident, and there's no calibration guarantee. Anthropic's API doesn't expose token-level log-probabilities either, so a genuinely independent second model judging the extraction ("does this claim actually appear in the source? is the category reasonable?") is the strongest cheap signal currently available.
+**Verification checks five dimensions:** textual fidelity to the source, environmental relevance, correct attribution to the company (not an unrelated quote), completeness of the extracted passage, and category correctness.
 
-**Resilience:** if the model's JSON output is malformed (a common cause: an unescaped quote character inside a verbatim claim, e.g. from a customer testimonial or normalized guillemets), a `json_repair` fallback recovers the claims instead of silently losing the whole page. If even that fails, the raw response is saved to `debug_failed_json/` for inspection.
+**Resilience:** malformed JSON output (commonly caused by an unescaped quote inside a verbatim claim) is recovered via a `json_repair` fallback rather than losing the whole page's claims. If that also fails, the raw response is saved to `debug_failed_json/` for inspection.
 
-**Output columns include:** Company, Page, Category, Verbatim Claim, English Translation, Language, Confidence, GPT Verified, GPT Notes, plus the six certification columns (added by Stage 3's merge step).
+**No-GPT variant:** `pipeline/extract_claimsNO_GPT_Check.py` + `archive/pipelineNO_GPT_Check.py` provide a cheaper alternative using self-reported confidence thresholding instead of a second-model check, for situations where the OpenAI cost/latency isn't justified. Kept in sync with the main extraction prompt; the verification mechanism is the only intentional difference.
 
 **Key functions:**
-- `process_scrape_result(anthropic_client, openai_client, scrape_result_dict)` → claims dict (the one to call from a pipeline; takes Stage 1's output directly, no disk round-trip needed)
-- `process_company_file(anthropic_client, openai_client, json_path)` — file-based wrapper, used by the CLI/batch mode
+- `process_scrape_result(anthropic_client, openai_client, scrape_result_dict)` → claims dict
 - `write_excel(results, output_path)`
 
-### Stage 3 — `cert_verifier_api.py`
+### Stage 3 — `pipeline/cert_verifier_api.py`
 
-Checks a company against **six** certification registries, each with a genuinely different data-access strategy:
+Checks a company against **six** certification registries:
 
 | Registry | Method | Notes |
 |---|---|---|
-| **EMAS** | Fetch-all-then-cache | One bulk download of the entire EU registry, filtered client-side by country and cached in memory |
-| **EU Organic (TRACES NT)** | Paginated per-country fetch | Cached per country after first fetch |
+| **EMAS** | Fetch-all-then-cache | Bulk download of the entire EU registry, filtered client-side by country and cached in memory |
+| **EU Organic (TRACES NT)** | Parallel-batch paginated fetch | Pages fetched in concurrent batches (not one at a time), cached per country after first fetch |
 | **B Corp** | Live search (Typesense) | Genuinely dynamic — no pre-fetching |
-| **Bord Bia (Origin Green)** | Local JSON cache (`bordbia_members_cache.json`) | Origin Green's site has bot-detection that makes live scraping fragile, so this uses a pre-scraped snapshot. Matches primarily by **domain** (most cache entries are raw URLs, not clean names), with fuzzy name matching as fallback |
-| **Biopartenaire** | Live HTTP fetch | Confirmed server-rendered plain HTML, no Playwright needed. Domain-matching only (the page is a logo grid linking to each member's own site) |
-| **BioED** | Live HTTP fetch | Confirmed server-rendered plain HTML. Name-based fuzzy matching only (page exposes names, not links) |
+| **Bord Bia (Origin Green)** | Local JSON cache (`data/bordbia_members_cache.json`) | Live scraping is unreliable due to bot-detection; uses a pre-scraped snapshot. Matches primarily by domain, with fuzzy name matching as fallback |
+| **Biopartenaire** | Live HTTP fetch | Confirmed server-rendered plain HTML, no Playwright needed. Domain-matching only |
+| **BioED** | Live HTTP fetch | Confirmed server-rendered plain HTML. Fuzzy name matching only |
 
-**Fuzzy name matching:** uses `difflib`, with two important refinements found through testing:
-- **Legal-suffix stripping** (Ltd, GmbH, SARL, etc.) before comparison — otherwise genuine matches like "Glenisk" vs. "Glenisk Ltd" score below threshold purely due to the extra word.
-- **Word-boundary containment bonus** — required to be anchored to whole words, not raw substrings, after discovering that raw substring matching produces false positives (e.g. "Aniva SRL" coincidentally containing the letters of "Danival").
-- **Match threshold: 90/100** — empirically chosen; genuine matches (after the above fixes) score 95–100, while coincidental short-name overlaps top out around 83.
+**Fuzzy name matching** (`difflib`), refined through testing: legal-suffix stripping (Ltd, GmbH, SARL, etc.), word-boundary-anchored containment (not raw substring matching, which caused false positives), and an empirically-set match threshold of 90/100.
 
-**Country-guessing optimization:** for EU Organic specifically (the only registry with real per-country network cost), the company's domain TLD is used to guess a single country to check when confident (`.ie` → Ireland, `.fr` → France, etc.), falling back to checking all four countries when the guess would be unreliable (e.g. `.com`).
+**Country override:** pass an explicit country to skip TLD-guessing entirely (`run_certification_stage(company_name, countries=["Ireland"], ...)`) — worth doing whenever the real country is known, since an ambiguous domain (`.com`, `.bio`) otherwise falls back to checking all four panel countries.
+
+**Robustness:** every registry lookup is wrapped in error handling — a timeout or failure on one registry degrades gracefully to "unable to verify" rather than crashing the whole pipeline run.
 
 **Key functions:**
-- `run_certification_stage(company_name, company_url=None)` → dict with all 6 registries' results
-- `merge_certifications_into_claims(claims_result, cert_result)` — stamps every claim with per-registry verification flags, so the flat claims dataset is self-contained for downstream classification (no joins needed)
-- `append_certifications_sheet(excel_path, results)` — adds a "Certifications" summary sheet to the Excel output
+- `run_certification_stage(company_name, countries=None, company_url=None)` → dict with all 6 registries' results
+- `merge_certifications_into_claims(claims_result, cert_result)` — stamps every claim with per-registry verification flags
+- `append_certifications_sheet(excel_path, results)` — adds a "Certifications" sheet to the Excel output
 
-### `pipelineV1.py` — orchestrator
+### Stage 4 — `pipeline/ecgt_pipeline_stage4.py`
 
-Chains Stages 1→2→3 for one company URL. This is what any future dashboard/UI should call.
+The substantive ECGT compliance classifier. Two-step design, intentionally kept separate:
+
+- **Step A (the decision):** a validated, unmodified classification call producing RED/AMBER/GREEN — few-shot prompted against ECGT rules, forced single-word output.
+- **Step B (the explanation):** a second call that receives the label Step A already produced (explicitly told it's final) and documents which rule applies, cites the specific Directive provision, gives remediation guidance (REMOVE/REWRITE/SUBSTANTIATE/NONE), and flags genuinely borderline cases for human review. It cannot change the label.
+
+Classification runs **concurrently across claims** (not one at a time) — each claim's Step A + Step B sequence is fully independent of every other claim's, so multiple claims classify in parallel without touching the validated decision procedure itself.
+
+**Key function:**
+- `run_ecgt_classification_stage(claims_result, anthropic_client)` → adds six fields to every claim (`ecgt_label`, `ecgt_rule_triggered`, `ecgt_citation`, `ecgt_explanation`, `ecgt_guidance`, `ecgt_review_flag`) and returns a summary dict
+
+### News check — `pipeline/news_verifier.py`
+
+Searches recent news (Google News RSS, up to a year back) for independent negative corroboration — lawsuits, fines, greenwashing accusations, regulatory action — that a company's own website wouldn't surface. Deliberately negative-signal-only: positive press doesn't tell us anything about whether specific claims are accurate. A Claude-based interpretation step filters out namesake mismatches and irrelevant coverage before flagging anything as a genuine controversy. Most companies in a small-SME sample will correctly return no results in any given window — this is expected, not a bug.
+
+### `pipeline/pipelineV1.py` — orchestrator
+
+Chains every stage for one company URL, with Stage 3/news-check parallelization and an optional `on_progress` callback for UI integration.
 
 ```python
-from pipelineV1 import run_pipeline
-claims_result, cert_result, excel_path = run_pipeline("https://glenisk.com", "Glenisk")
+from pipeline.pipelineV1 import run_pipeline
+
+claims_result, cert_result, ecgt_result, news_result, excel_path = run_pipeline(
+    "https://glenisk.com", "Glenisk", countries=["Ireland"]
+)
 ```
 
 ---
@@ -120,34 +142,41 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-**3. Set your API keys** (needed by Stages 1–3):
+**3. Set your API keys:**
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 export OPENAI_API_KEY="sk-..."
+export NEWSAPI_KEY="..."   # only needed if using the legacy NewsAPI path; Google News RSS needs no key
 ```
-Add these to your shell profile (`~/.zshrc` on Mac) to persist across sessions. If running via PyCharm's Run button rather than Terminal, also add them under that run configuration's **Environment variables** field — PyCharm run configs don't inherit shell environment variables automatically.
+Add these to your shell profile (`~/.zshrc` on Mac) to persist across sessions. If running via PyCharm's Run button rather than Terminal, also add them under that run configuration's **Environment variables** field — PyCharm run configs don't inherit shell environment variables automatically. For Streamlit, set them via `.streamlit/secrets.toml` if deploying to Streamlit Cloud, or the environment/`.env` file for a self-hosted deployment.
 
-**4. Make sure `bordbia_members_cache.json` is present** in the project root (Stage 3 reads it directly; it's a static snapshot, not fetched live, since Origin Green's site has bot-detection).
+**4. `data/bordbia_members_cache.json` must be present** (Stage 3 reads it directly via a path resolved relative to `cert_verifier_api.py`'s own location, so it works regardless of what directory the app is launched from).
 
 ---
 
 ## Usage
 
-**Run the full pipeline for one company:**
+**Run the Streamlit dashboard:**
 ```bash
-python pipelineV1.py https://glenisk.com "Glenisk"
+streamlit run app.py
+```
+
+**Run the full pipeline for one company from the CLI:**
+```bash
+python pipeline/pipelineV1.py https://glenisk.com "Glenisk"
+python pipeline/pipelineV1.py https://glenisk.com "Glenisk" "Ireland"   # explicit country, skips TLD-guessing
 ```
 Company name is optional — derived from the domain if omitted.
 
 **Run a single stage standalone** (useful for debugging one part without re-running everything):
 ```bash
-python data_collection.py https://glenisk.com "Glenisk"
-python cert_verifier_api.py   # runs the built-in demo check on a few sample companies
+python pipeline/data_collection.py https://glenisk.com "Glenisk"
+python pipeline/cert_verifier_api.py   # runs the built-in demo check on a few sample companies
 ```
 
 **Batch mode for Stage 2** (processing a folder of already-scraped JSON files):
 ```bash
-python extract_claims.py --input ./scraped_data/ --output results.xlsx
+python pipeline/extract_claims.py --input ./scraped_data/ --output results.xlsx
 ```
 
 ---
@@ -155,18 +184,33 @@ python extract_claims.py --input ./scraped_data/ --output results.xlsx
 ## Project structure
 
 ```
-├── data_collection.py            # Stage 1: scraping
-├── extract_claims.py             # Stage 2: claim extraction + GPT verification
-├── cert_verifier_api.py          # Stage 3: certification checks (6 registries)
-├── pipelineV1.py                 # Orchestrator, chains Stages 1-3
-├── pipeline_Old.py               # Deprecated, kept for reference only
-├── bordbia_members_cache.json    # Static Origin Green members snapshot
+├── app.py                          # Streamlit dashboard entry point
+├── pipeline/                       # live pipeline package
+│   ├── __init__.py
+│   ├── data_collection.py          # Stage 1: scraping
+│   ├── extract_claims.py           # Stage 2: claim extraction + GPT verification
+│   ├── extract_claimsNO_GPT_Check.py  # Stage 2, confidence-threshold variant
+│   ├── cert_verifier_api.py        # Stage 3: certification checks (6 registries)
+│   ├── ecgt_pipeline_stage4.py     # Stage 4: ECGT RAG classification
+│   ├── claude_classifier_tool.py   # Step A classification internals (validated, unmodified)
+│   ├── news_verifier.py            # recent-news corroboration check
+│   ├── pipelineV1.py               # main orchestrator
+│   └── pipelineNO_GPT_Check.py     # orchestrator using the confidence-threshold variant
+├── Classifier/                     # validation-only scripts — NOT part of the live pipeline
+│   ├── claude_classifier.py
+│   ├── evaluate_f1.py
+│   ├── evaluate_kappa.py
+│   ├── gemini_classifier.py
+│   └── validation_test_set_real.csv
+├── archive/                        # deprecated, kept for reference only
+│   └── pipeline_Old.py
+├── data/
+│   └── bordbia_members_cache.json  # static Origin Green members snapshot
+├── scripts/                        # one-off diagnostic scripts
+├── .streamlit/                     # Streamlit config/secrets
 ├── requirements.txt
 ├── .gitignore
-├── scripts/
-│   ├── inspect_bioed_html.py     # One-off diagnostic: BioED page structure
-│   └── test_biopartenaire_bioed.py  # One-off diagnostic: feasibility test
-└── scraped_data/                 # Generated at runtime, gitignored
+└── scraped_data/                   # generated at runtime, gitignored
 ```
 
 ---
@@ -175,22 +219,16 @@ python extract_claims.py --input ./scraped_data/ --output results.xlsx
 
 Worth stating explicitly for the dissertation's methodology/limitations section:
 
-- **Confidence scores are self-reported by the extracting LLM**, not calibrated probabilities — the GPT verification pass is a partial mitigation, not a full fix, since Anthropic's API doesn't expose token-level log-probabilities.
+- **Confidence scores are self-reported by the extracting LLM**, not calibrated probabilities — the second-model verification pass is a partial mitigation, not a full fix, since Anthropic's API doesn't expose token-level log-probabilities.
 - **Bord Bia matching relies on a static cache**, not a live feed — if Origin Green's membership list changes, the cache needs to be manually regenerated.
-- **Biopartenaire and BioED are French-specific labels** — only meaningfully relevant to the French companies in the sample (Danival, Belledonne); expect these columns to be empty for the Irish/Belgian/Austrian companies, which is expected, not a bug.
-- **The 90-point fuzzy match threshold** was tuned empirically against observed true/false match pairs in this specific sample — worth a sensitivity check if the SME panel changes significantly.
-- **GPT verification adds cost and latency** per page (one extra API call), and depends on a second provider's API being available.
-
----
-
-## Roadmap
-
-- **Stage 4/5 — ECGT rules engine**: RED/AMBER/GREEN classification against Directive 2024/825 and Ireland SI 124/2026, few-shot prompted. Currently under active tuning (AMBER recall and French-claim RED-classification issues being investigated separately).
-- **Batch runner** across the full SME sample, reusing a single `CertVerifier` instance so EMAS/EU Organic data is fetched once rather than once per company.
-- **Dashboard/demo** (Streamlit or similar) wrapping `run_pipeline()` for a live, single-URL-in demo.
+- **Biopartenaire and BioED are French-specific labels** — only meaningfully relevant to French companies in the sample; expect these columns to be empty for the rest, which is expected, not a bug.
+- **The 90-point fuzzy match threshold** was tuned empirically against observed true/false match pairs in this specific sample.
+- **Certain company websites employ anti-scraping measures** (headless-browser detection) that block automated access even after standard evasion attempts; affected companies were excluded from the sample rather than pursued via further circumvention.
+- **The news check uses an unofficial, undocumented Google feed** with no published SLA, returns a relevance-ranked (not exhaustive) result set regardless of the requested time window, and provides no full article text without a separate scraping step.
+- **Second-model verification and classification add real cost and latency**, and depend on external providers' APIs remaining available.
 
 ---
 
 ## Team
 
-Built by Tuna Erdem, with Sundus and Yifei, as part of an MSc Business Analytics capstone at Trinity College Dublin, in collaboration with EY Ireland.
+Built by Sundus Afreen, Tuna Cemal Erdem, and Yifei Yu, as part of an MSc Business Analytics capstone at Trinity College Dublin, in collaboration with EY Ireland, supervised by Dr. Baidyanath Biswas.

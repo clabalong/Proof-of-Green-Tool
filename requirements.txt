@@ -8,3 +8,4 @@ json_repair
 playwright
 pandas
 scikit-learn
+streamlit

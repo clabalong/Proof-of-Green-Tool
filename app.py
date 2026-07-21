@@ -236,6 +236,15 @@ def set_ai_summary(conn, company: str, summary: str):
     conn.commit()
 
 
+def delete_ai_summary(conn, company: str):
+    """Removes a cached AI summary for a company, if one exists. Called
+    after a successful pipeline rerun — the old summary was generated
+    from claims that no longer reflect the freshly re-classified data,
+    so it must not survive the rerun as if it were still accurate."""
+    conn.execute("DELETE FROM ai_summaries WHERE company = ?", (company,))
+    conn.commit()
+
+
 def generate_ai_summary(company: str, sub: pd.DataFrame, news_row) -> str:
     """On-demand executive summary — a single live API call, made only
     when the user clicks the button, NOT part of the pipeline. Uses only
@@ -641,7 +650,7 @@ with st.sidebar.expander("➕ Run pipeline on a new company"):
             # etc.) can't break the rest of the dashboard for someone who
             # never uses this feature.
             try:
-                from pipelineV1 import run_pipeline
+                from pipeline.pipelineV1 import run_pipeline
             except Exception as e:
                 st.error(f"Could not import pipelineV1: {e}")
                 st.stop()
@@ -662,12 +671,15 @@ with st.sidebar.expander("➕ Run pipeline on a new company"):
                         verbose=False,
                         on_progress=_on_progress,
                     )
-                    _, _, ecgt_result, news_result, excel_path = result
+                    claims_result, _, ecgt_result, news_result, excel_path = result
                 except Exception as e:
                     status.update(label=f"Failed: {e}", state="error")
                     st.stop()
 
                 status.update(label="Pipeline complete!", state="complete")
+
+            resolved_company = claims_result.get("company_name", label)
+            delete_ai_summary(conn, resolved_company)
 
             st.success(f"Done — saved to {excel_path}. "
                         f"ECGT labels: {ecgt_result['label_distribution']}")

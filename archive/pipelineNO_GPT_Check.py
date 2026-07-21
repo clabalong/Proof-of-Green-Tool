@@ -40,7 +40,7 @@ from pathlib import Path
 import anthropic
 
 from data_collection import run_single_scrape
-from extract_claimsNO_GPT_Check import process_scrape_result, write_excel, CONFIDENCE_THRESHOLD
+from archive.extract_claimsNO_GPT_Check import process_scrape_result, write_excel, CONFIDENCE_THRESHOLD
 from cert_verifier_api import run_certification_stage, append_certifications_sheet, merge_certifications_into_claims
 from news_verifier import check_news_controversy, append_news_sheet
 
