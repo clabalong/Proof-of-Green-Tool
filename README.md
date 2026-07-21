@@ -189,13 +189,11 @@ python pipeline/extract_claims.py --input ./scraped_data/ --output results.xlsx
 │   ├── __init__.py
 │   ├── data_collection.py          # Stage 1: scraping
 │   ├── extract_claims.py           # Stage 2: claim extraction + GPT verification
-│   ├── extract_claimsNO_GPT_Check.py  # Stage 2, confidence-threshold variant
 │   ├── cert_verifier_api.py        # Stage 3: certification checks (6 registries)
 │   ├── ecgt_pipeline_stage4.py     # Stage 4: ECGT RAG classification
 │   ├── claude_classifier_tool.py   # Step A classification internals (validated, unmodified)
 │   ├── news_verifier.py            # recent-news corroboration check
-│   ├── pipelineV1.py               # main orchestrator
-│   └── pipelineNO_GPT_Check.py     # orchestrator using the confidence-threshold variant
+│   └── pipelineV1.py               # main orchestrator
 ├── Classifier/                     # validation-only scripts — NOT part of the live pipeline
 │   ├── claude_classifier.py
 │   ├── evaluate_f1.py
@@ -203,10 +201,12 @@ python pipeline/extract_claims.py --input ./scraped_data/ --output results.xlsx
 │   ├── gemini_classifier.py
 │   └── validation_test_set_real.csv
 ├── archive/                        # deprecated, kept for reference only
-│   └── pipeline_Old.py
+│   ├── pipeline_Old.py
+│   ├── pipelineNO_GPT_Check.py     # orchestrator using the confidence-threshold variant
+│   └── extract_claimsNO_GPT_Check.py  # Stage 2, confidence-threshold variant
 ├── data/
 │   └── bordbia_members_cache.json  # static Origin Green members snapshot
-├── scripts/                        # one-off diagnostic scripts
+├── test_scripts/                        # one-off diagnostic scripts
 ├── .streamlit/                     # Streamlit config/secrets
 ├── requirements.txt
 ├── .gitignore
